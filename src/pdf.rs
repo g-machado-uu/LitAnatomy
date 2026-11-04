@@ -28,7 +28,7 @@ pub fn to_stored(file: &Path, folder: Option<&Path>) -> String {
 /// The file on this computer for a stored path.
 pub fn resolve(stored: &str, folder: Option<&Path>) -> PathBuf {
     let path = PathBuf::from(stored);
-    if path.is_absolute() || looks_like_windows_absolute(stored) {
+    if path.is_absolute() || looks_absolute(stored) {
         return path;
     }
     match folder {
@@ -37,9 +37,14 @@ pub fn resolve(stored: &str, folder: Option<&Path>) -> PathBuf {
     }
 }
 
-fn looks_like_windows_absolute(s: &str) -> bool {
+/// Absolute on any system, so a library moved between Windows and
+/// Linux/macOS never glues another system's absolute path onto the folder.
+/// `to_stored` never writes a relative path starting with '/'.
+fn looks_absolute(s: &str) -> bool {
     let b = s.as_bytes();
-    (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')) || s.starts_with("\\\\")
+    s.starts_with('/')
+        || s.starts_with("\\\\")
+        || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
 }
 
 /// Opens the file with the default application (the PDF viewer).
@@ -89,8 +94,10 @@ mod tests {
         assert_eq!(to_stored(file, Some(Path::new("/home/me/Papers"))), "/tmp/x.pdf");
         assert_eq!(to_stored(file, None), "/tmp/x.pdf");
         assert_eq!(resolve("/tmp/x.pdf", Some(Path::new("/home"))), Path::new("/tmp/x.pdf"));
-        assert!(looks_like_windows_absolute(r"C:\Papers\x.pdf"));
-        assert!(!looks_like_windows_absolute("RIS/x.pdf"));
+        assert!(looks_absolute(r"C:\Papers\x.pdf"));
+        assert!(looks_absolute(r"\\server\share\x.pdf"));
+        assert!(looks_absolute("/tmp/x.pdf"));
+        assert!(!looks_absolute("RIS/x.pdf"));
     }
 
     #[test]

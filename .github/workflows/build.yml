@@ -25,6 +25,8 @@ jobs:
   build:
     needs: audit
     strategy:
+      # Finish every system even if one fails, so one run shows all problems.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
