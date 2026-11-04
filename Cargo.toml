@@ -1,0 +1,40 @@
+[package]
+name = "litanatomy"
+version = "0.1.0"
+edition = "2024"
+# Required by egui 0.37.
+rust-version = "1.95"
+description = "Dissect, summarise and cite the papers of a literature review"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+deunicode = "1.6"
+directories = "6.0.0"
+eframe = "0.37"
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
+egui_extras = "0.37"
+open = "5.4"
+rfd = "0.17.2"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1"
+ureq = "3.5"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot", "eframe"] }
+tempfile = "3.27.0"
+
+# egui and SQLite are slow unoptimised; keep debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true

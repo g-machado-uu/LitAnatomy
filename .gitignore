@@ -1,0 +1,15 @@
+/target
+
+# Personal / local material, never committed
+/Inspiration
+/Lit Review.xlsx
+*.xlsx
+CLAUDE.md
+RELEASING.md
+!tests/fixtures/*.xlsx
+
+# Local libraries and backups
+*.litanatomy
+*.litanatomy-journal
+*.litanatomy-wal
+*.litanatomy-shm

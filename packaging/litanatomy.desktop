@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LitAnatomy
+GenericName=Literature Review Organiser
+Comment=Dissect, summarise and cite the papers of your literature review
+Exec=litanatomy
+Icon=litanatomy
+Terminal=false
+Categories=Office;Education;Science;
+Keywords=bibliography;bibtex;references;papers;literature;review;phd;
+StartupWMClass=litanatomy

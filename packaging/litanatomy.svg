@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#1E5AA8"/>
+  <!-- A paper, its sections laid open -->
+  <path d="M68 44h86l34 34v118a12 12 0 0 1-12 12H68a12 12 0 0 1-12-12V56a12 12 0 0 1 12-12z" fill="#FFFFFF"/>
+  <path d="M154 44v26a8 8 0 0 0 8 8h26z" fill="#BFD4F0"/>
+  <rect x="76" y="76" width="56" height="10" rx="5" fill="#1E5AA8"/>
+  <rect x="76" y="100" width="92" height="8" rx="4" fill="#9DBBE3"/>
+  <rect x="76" y="118" width="80" height="8" rx="4" fill="#9DBBE3"/>
+  <rect x="76" y="136" width="48" height="8" rx="4" fill="#9DBBE3"/>
+  <!-- Lens -->
+  <circle cx="160" cy="166" r="34" fill="#1E5AA8" stroke="#FFFFFF" stroke-width="12"/>
+  <circle cx="160" cy="166" r="16" fill="none" stroke="#9DBBE3" stroke-width="6" stroke-dasharray="20 10"/>
+  <path d="M184 190l26 26" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round"/>
+</svg>
