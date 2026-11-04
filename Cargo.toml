@@ -1,6 +1,6 @@
 [package]
 name = "litanatomy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Required by egui 0.37.
 rust-version = "1.95"
