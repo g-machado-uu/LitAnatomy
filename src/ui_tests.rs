@@ -199,3 +199,44 @@ fn unreadable_library_offers_another() {
     assert!(matches!(h.state().screen, Screen::Failed { .. }));
     assert!(h.query_by_label_contains("not a LitAnatomy library").is_some());
 }
+
+#[test]
+fn zotero_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let zotero = dir.path().join("Zotero");
+    std::fs::create_dir_all(&zotero).unwrap();
+    let fixture = crate::import::zotero::tests::library(&zotero);
+    fixture.execute("VACUUM INTO ?1", [zotero.join("zotero.sqlite").to_string_lossy()]).unwrap();
+
+    let mut h = harness(&dir.path().join("library.litanatomy"), Settings { theme_mode: ThemeMode::Light, ..Default::default() });
+    let s = session(&mut h);
+    let thesis = s.lib.create_collection("Thesis", None, 0).unwrap();
+    // The article is already in the library, without its PDF.
+    let mut known = crate::model::NewPaper::default();
+    known.bib.title = "Reconfigurable intelligent surfaces".into();
+    known.bib.doi = Some("10.1109/tap.2025.1234567".into());
+    let known = s.lib.add_paper(&known, "[auth][year][Title]").unwrap();
+    s.refresh_cache();
+
+    session(&mut h).import_zotero_from(&zotero, None);
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Left out: 1 other item in Zotero").is_some());
+    assert!(h.query_by_label_contains("1 already in your library").is_some());
+    // Choosing where they go (the "Add to" menu).
+    match &mut session(&mut h).dialog {
+        Some(Dialog::Import(state)) => state.target = Some(thesis),
+        _ => panic!("import preview not shown"),
+    }
+    h.run_steps(2);
+    shot(&mut h, "12_zotero_preview");
+    h.get_by_label_contains("Import 1 new paper").click();
+    h.run_steps(3);
+
+    let s = session(&mut h);
+    let rows = s.lib.rows(Scope::Collection(thesis)).unwrap();
+    assert_eq!(rows.len(), 2, "both papers in the chosen collection");
+    let pdf = s.lib.paper(known).unwrap().pdf_path.expect("PDF linked to the paper already in the library");
+    assert!(pdf.ends_with("Zhang - 2025.pdf"), "{pdf}");
+    let lone = rows.iter().find(|r| r.id != known).unwrap().id;
+    assert!(s.lib.paper(lone).unwrap().pdf_path.is_some_and(|p| p.ends_with("viruses_as_power_generators.pdf")));
+}

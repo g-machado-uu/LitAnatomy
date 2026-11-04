@@ -83,6 +83,13 @@ impl Session {
             if ui.button(format!("{}  Import a file…", icons::DOWNLOAD_SIMPLE)).on_hover_text("BibTeX, BibLaTeX, RIS, RefWorks or CSL-JSON").clicked() {
                 self.pick_import_file();
             }
+            if ui
+                .button(format!("{}  From Zotero…", icons::BOOKS))
+                .on_hover_text("The papers whose PDFs Zotero has downloaded, with their details")
+                .clicked()
+            {
+                self.import_zotero();
+            }
             if ui.button(format!("{}  Blank entry", icons::FILE_PLUS)).clicked() {
                 self.new_blank_paper();
             }

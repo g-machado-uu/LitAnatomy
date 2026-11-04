@@ -14,6 +14,9 @@ This application was developed with the assistance of Claude Code using Opus 5.5
 - **Import references** from BibTeX, BibLaTeX, RIS (EndNote, Mendeley, Zotero,
   Web of Science, Scopus, IEEE Xplore), RefWorks and CSL-JSON. A preview shows
   each paper's new key and any duplicates before importing.
+- **Import from Zotero** (Add papers › From Zotero…): the papers whose PDFs
+  Zotero has downloaded, with their details, tags and linked PDFs. It reads a
+  copy of Zotero's library, so Zotero can stay open and is never changed.
 - **Collections** (with sub-collections) for each piece of work: a first-year
   assessment, a paper you are writing, a thesis chapter, your viva. A paper
   can be in several.

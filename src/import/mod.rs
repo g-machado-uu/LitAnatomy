@@ -6,6 +6,7 @@ pub mod doi;
 pub mod names;
 pub mod refworks;
 pub mod ris;
+pub mod zotero;
 
 use std::path::Path;
 

@@ -50,7 +50,7 @@ impl Session {
     fn quick_add(&mut self, ui: &mut Ui) {
         theme::card(ui, "Add a paper", |ui| {
             ui.horizontal(|ui| {
-                let button_w = 280.0;
+                let button_w = 380.0;
                 let edit = egui::TextEdit::singleline(&mut self.quick_doi)
                     .hint_text("Paste a DOI or a doi.org link, e.g. 10.1109/TAP.2025.3603900")
                     .desired_width((ui.available_width() - button_w).max(200.0));
@@ -64,6 +64,9 @@ impl Session {
                 }
                 if ui.button(format!("{} Import file…", icons::DOWNLOAD_SIMPLE)).clicked() {
                     self.pick_import_file();
+                }
+                if ui.button(format!("{} Zotero…", icons::BOOKS)).on_hover_text("Import the papers whose PDFs Zotero has downloaded").clicked() {
+                    self.import_zotero();
                 }
             });
             theme::hint(ui, "Several DOIs can be pasted at once. You can also drop a .bib, .ris or .json file anywhere in the window.");

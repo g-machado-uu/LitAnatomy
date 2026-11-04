@@ -406,6 +406,41 @@ impl Session {
         }
     }
 
+    /// Imports the papers whose PDFs Zotero has downloaded, from Zotero's
+    /// data folder in its usual place, or one the user chooses.
+    pub fn import_zotero(&mut self) {
+        let dir = match import::zotero::default_dir() {
+            Some(dir) => dir,
+            None => match rfd::FileDialog::new().set_title("Choose Zotero's data folder (the one with \"storage\" in it)").pick_folder() {
+                Some(dir) => dir,
+                None => return,
+            },
+        };
+        self.import_zotero_from(&dir, self.current_collection());
+    }
+
+    pub fn import_zotero_from(&mut self, dir: &Path, target: Option<i64>) {
+        match import::zotero::read(dir) {
+            Ok(zotero) => {
+                let source = format!("Zotero ({})", dir.display());
+                let mut state = ImportState::new(source, None, target, self.settings.keep_readable_keys);
+                if zotero.without_pdf > 0 {
+                    let items = crate::ui::sidebar::plural(zotero.without_pdf, "other item");
+                    state.note = Some(format!("Only papers with a downloaded PDF are imported. Left out: {items} in Zotero."));
+                }
+                state.errors = zotero.parsed.errors;
+                state.candidates = zotero.parsed.papers.into_iter().map(Candidate::new).collect();
+                state.refresh(&self.lib, &self.settings.citekey_pattern);
+                if state.candidates.is_empty() && state.errors.is_empty() {
+                    self.error("Zotero has no downloaded PDFs to import. Download them in Zotero first.");
+                } else {
+                    self.dialog = Some(Dialog::Import(state));
+                }
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
     pub fn pick_import_file(&mut self) {
         let target = self.current_collection();
         if let Some(path) = rfd::FileDialog::new()

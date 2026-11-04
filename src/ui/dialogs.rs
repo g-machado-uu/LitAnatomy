@@ -57,12 +57,14 @@ pub struct ImportState {
     /// DOI lookups still running: (batch, how many left).
     pub pending: Option<(u64, usize)>,
     pub keep_keys: bool,
+    /// A line under the summary, e.g. what was left out.
+    pub note: Option<String>,
     checked: usize,
 }
 
 impl ImportState {
     pub fn new(source: String, base_dir: Option<PathBuf>, target: Option<i64>, keep_keys: bool) -> Self {
-        Self { source, base_dir, candidates: Vec::new(), errors: Vec::new(), target, pending: None, keep_keys, checked: 0 }
+        Self { source, base_dir, candidates: Vec::new(), errors: Vec::new(), target, pending: None, keep_keys, note: None, checked: 0 }
     }
 
     /// Works out keys (unique against the library and each other) and
@@ -252,6 +254,9 @@ impl Session {
                 summary.push_str(&format!(" · {dups} already in your library"));
             }
             ui.label(RichText::new(summary).color(theme::muted(ui)));
+            if let Some(note) = &state.note {
+                ui.label(RichText::new(note).small().color(theme::muted(ui)));
+            }
             if let Some((_, left)) = state.pending {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -268,6 +273,9 @@ impl Session {
                         ui.selectable_value(&mut state.target, Some(c.id), &c.name);
                     }
                 });
+                if state.target.is_none() {
+                    ui.label(RichText::new("You can drag them onto a collection later.").small().color(theme::muted(ui)));
+                }
                 ui.add_space(12.0);
                 if ui
                     .checkbox(&mut state.keep_keys, "Keep readable keys from the file")
@@ -390,6 +398,17 @@ impl Session {
             };
             if let Some(id) = id {
                 touched.push(id);
+                // A paper already in the library gets the PDF if it has none.
+                if c.duplicate.is_some()
+                    && matches!(c.choice, Choice::UseExisting | Choice::Merge)
+                    && let Some(raw) = c.paper.pdf_path.as_deref()
+                    && self.lib.paper(id).is_ok_and(|p| p.pdf_path.is_none())
+                {
+                    let stored = self.import_pdf_path(raw, state.base_dir.as_deref());
+                    if let Err(e) = self.lib.set_pdf(id, Some(&stored)) {
+                        first_error.get_or_insert(e);
+                    }
+                }
             }
         }
         if let Some(target) = state.target {
