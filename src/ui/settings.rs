@@ -378,6 +378,22 @@ impl Session {
                 "PDFs inside this folder are remembered relative to it, so the library still finds them on another computer \
                  (or another operating system) where the folder lives elsewhere. PDFs open in your system's PDF viewer.",
             );
+            if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                ui.add_space(6.0);
+                if ui
+                    .checkbox(&mut self.settings.native_wayland, "Native Wayland window")
+                    .on_hover_text("Takes effect when LitAnatomy is next started.")
+                    .changed()
+                {
+                    changed = true;
+                }
+                theme::hint(
+                    ui,
+                    "On Wayland, PDFs and files can only be dropped on the window when it runs through XWayland (the default). \
+                     A native Wayland window can look sharper with display scaling, but nothing can be dropped on it: paste \
+                     copied files with Ctrl+V instead, or use Add papers › From PDFs…. Restart LitAnatomy after changing this.",
+                );
+            }
         });
         if changed {
             self.save_settings(ui.ctx());
@@ -436,7 +452,9 @@ impl Session {
             });
             theme::hint(
                 ui,
-                "DOIs are looked up at doi.org and Crossref. Crossref asks heavy users for a contact address and serves them faster; \
+                "DOIs are looked up at doi.org and Crossref, arXiv IDs at arXiv, ISBNs at Open Library (then Google Books) and \
+                 PubMed IDs at NCBI. A PDF without an identifier is searched for on Crossref by its title or opening words; the \
+                 PDF itself never leaves your computer. Crossref asks heavy users for a contact address and serves them faster; \
                  it is only sent if you type one here.",
             );
         });

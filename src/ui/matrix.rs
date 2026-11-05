@@ -8,7 +8,7 @@ use egui_extras::{Column, TableBuilder};
 use crate::app::{Session, View, safe_file_name};
 use crate::db::Scope;
 use crate::export::{self, matrix};
-use crate::model::{Field, FieldKind, PaperRow, parse_metrics, parse_quotes};
+use crate::model::{Criterion, Decision, Field, FieldKind, PaperRow, Screening, criterion_code, parse_metrics, parse_quotes};
 use crate::ui::dialogs::Dialog;
 use crate::ui::{icons, theme};
 
@@ -19,6 +19,8 @@ pub enum Col {
     Metric(String),
     /// The collection's relevance notes.
     Relevance,
+    /// The screening decision, criteria and note (review collections).
+    Screening,
 }
 
 /// What the matrix shows, rebuilt when the library changes.
@@ -29,6 +31,8 @@ struct Data {
     notes: HashMap<(i64, i64), String>,
     relevance: HashMap<i64, String>,
     metric_names: Vec<String>,
+    /// Some for collections that screen.
+    screening: Option<(HashMap<i64, Screening>, Vec<Criterion>)>,
 }
 
 #[derive(Default)]
@@ -43,6 +47,7 @@ impl Data {
             Col::Field(id) => self.fields.iter().find(|f| f.id == *id).map(|f| f.label.clone()).unwrap_or_default(),
             Col::Metric(name) => name.clone(),
             Col::Relevance => "Relevance".into(),
+            Col::Screening => "Screening".into(),
         }
     }
 
@@ -73,6 +78,19 @@ impl Data {
                 .map(|m| m.value_with_unit())
                 .unwrap_or_default(),
             Col::Relevance => self.relevance.get(&paper).cloned().unwrap_or_default(),
+            Col::Screening => {
+                let Some((all, criteria)) = &self.screening else { return String::new() };
+                let s = all.get(&paper).cloned().unwrap_or_default();
+                let codes: Vec<String> = s.criteria.iter().filter_map(|c| criterion_code(criteria, *c)).collect();
+                let mut text = s.decision.label().to_string();
+                if !codes.is_empty() {
+                    text.push_str(&format!(" ({})", codes.join(", ")));
+                }
+                if !s.note.trim().is_empty() {
+                    text.push_str(&format!(": {}", s.note.trim()));
+                }
+                text
+            }
         }
     }
 
@@ -80,6 +98,9 @@ impl Data {
         let mut cols: Vec<Col> = self.fields.iter().filter(|f| !f.hidden && f.kind != FieldKind::Relevance).map(|f| Col::Field(f.id)).collect();
         if matches!(scope, Scope::Collection(_)) {
             cols.push(Col::Relevance);
+        }
+        if self.screening.is_some() {
+            cols.push(Col::Screening);
         }
         cols.extend(self.metric_names.iter().cloned().map(Col::Metric));
         cols
@@ -96,6 +117,9 @@ impl Data {
             })
             .map(|f| Col::Field(f.id))
             .collect();
+        if self.screening.is_some() {
+            cols.insert(0, Col::Screening);
+        }
         cols.extend(self.metric_names.iter().take(3).cloned().map(Col::Metric));
         cols
     }
@@ -158,7 +182,17 @@ impl Session {
                 }
             }
         }
-        let data = Data { rows, fields, notes, relevance, metric_names };
+        let screening = match scope {
+            Scope::Collection(c) if self.collection(c).is_some_and(|c| c.screening) => {
+                Some((self.lib.screenings(c).unwrap_or_default(), self.lib.criteria(c).unwrap_or_default()))
+            }
+            _ => None,
+        };
+        // In a review, excluded papers go last.
+        if let Some((all, _)) = &screening {
+            rows.sort_by_key(|r| all.get(&r.id).is_some_and(|s| s.decision == Decision::Exclude));
+        }
+        let data = Data { rows, fields, notes, relevance, metric_names, screening };
         self.matrix.data = Some((rev, scope, data.clone()));
         data
     }

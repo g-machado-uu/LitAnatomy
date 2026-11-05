@@ -9,8 +9,16 @@ This application was developed with the assistance of Claude Code using Opus 5.5
 
 ## Features
 
-- **Add papers by DOI.** Paste one or many, in any form: `10.1109/…`,
-  `DOI: 10.1109/…`, `https://doi.org/…`, `Digital Object Identifier 10.…`.
+- **Add papers by DOI, arXiv ID, ISBN or PubMed ID.** Paste one or many, in
+  any form: `10.1109/…`, `https://doi.org/…`, `arXiv:2301.12345`,
+  `ISBN 978-0-470-63155-3`, `PMID: 31452104`.
+- **Add papers from their PDFs.** Drop PDFs (or a folder of them) on the
+  window or on the drop area on Home, paste files copied in your file manager
+  (Ctrl+V), or use Add papers › From PDFs…. LitAnatomy finds the DOI, arXiv ID
+  or ISBN in each PDF, looks the paper up, checks that the title matches the
+  PDF, and keeps the PDF linked so it opens from the paper. If no identifier
+  is found, it searches Crossref by title, and otherwise uses the PDF's own
+  details, marked for you to check.
 - **Import references** from BibTeX, BibLaTeX, RIS (EndNote, Mendeley, Zotero,
   Web of Science, Scopus, IEEE Xplore), RefWorks and CSL-JSON. A preview shows
   each paper's new key and any duplicates before importing.
@@ -38,6 +46,16 @@ This application was developed with the assistance of Claude Code using Opus 5.5
 
 - **Synthesis matrix.** Compare papers side by side, then export the table to
   CSV, Markdown or LaTeX.
+- **Synthesis notes for a collection.** Group its papers into themes, note
+  what each theme's papers share and how each paper fits, keep overview notes,
+  and draft a related-work outline (a section per theme, with `\cite` keys and
+  the open problems from the papers' notes). Export the outline as Markdown or
+  LaTeX.
+- **Systematic reviews.** Turn on screening for a collection, write its
+  inclusion and exclusion criteria, then include, exclude or mark each paper
+  "maybe" on its Screening tab, ticking the criteria that apply. The list
+  shows how far the screening has got and why papers were excluded, and
+  copies the counts for a PRISMA flow diagram.
 - **Readable citation keys** like `zhang2025Wideband`, from a pattern you can
   change. Numeric keys from IEEE Xplore and similar sources are replaced. Once
   exported, a key is pinned so your LaTeX keeps compiling.
@@ -48,6 +66,10 @@ This application was developed with the assistance of Claude Code using Opus 5.5
   against, same group.
 - **Reading status, tags and full-text search** across titles, authors and
   notes.
+- **Keyboard shortcuts.** Tab and Shift+Tab move between a paper's notes,
+  Ctrl+Enter (Cmd+Enter on a Mac) stops editing, Esc goes back a level, and
+  Ctrl+Shift+Delete moves the open paper to the Trash. F1, or the keyboard
+  button at the bottom left, lists them all.
 - **Light and dark mode** and six colour themes.
 - **One library file.** Easy to back up, or keep it in a synced folder and use
   it on one computer at a time.
@@ -81,6 +103,11 @@ Then build:
 cargo build --release
 ```
 
+On a Wayland desktop, LitAnatomy runs through XWayland, because dropping
+files on a native Wayland window doesn't work yet in the windowing library it
+uses. Settings › PDFs can switch to a native Wayland window; dropping then
+won't work, but pasting copied files (Ctrl+V) still does.
+
 On Linux, `./install.sh` builds LitAnatomy and installs it for your user,
 with a launcher and an icon. `./install.sh --uninstall` removes it again.
 
@@ -103,7 +130,15 @@ with a launcher and an icon. `./install.sh --uninstall` removes it again.
 
 ## Privacy
 
-DOI lookups go to doi.org, and to api.crossref.org if doi.org has no record.
+Lookups only happen when you add papers or press "Fill in":
+
+- DOIs go to doi.org, and to api.crossref.org if doi.org has no record.
+- arXiv IDs go to export.arxiv.org; ISBNs to openlibrary.org, then Google
+  Books; PubMed IDs to NCBI (eutils.ncbi.nlm.nih.gov).
+- For a PDF without an identifier, its title (or, failing that, the opening
+  words of its first page) is sent to api.crossref.org to search for it.
+  The PDF itself never leaves your computer.
+
 Nothing else leaves your computer. If you type a contact email in Settings,
 it is sent to Crossref, as their "polite pool" asks.
 

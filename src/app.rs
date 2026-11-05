@@ -12,7 +12,7 @@ use crate::db::{Library, Scope};
 use crate::export;
 use crate::import;
 use crate::model::{Collection, NewPaper, PaperRow, ReadingStatus};
-use crate::net::{Net, NetMsg};
+use crate::net::{Job, Net, NetMsg};
 use crate::pdf;
 use crate::settings::{self, Settings};
 use crate::ui::dialogs::{Candidate, Dialog, ImportState};
@@ -28,17 +28,19 @@ pub enum View {
     List(Scope),
     Paper(i64),
     Matrix(Scope),
+    /// A collection's synthesis: themes and a related-work outline.
+    Synthesis(i64),
     Settings,
 }
 
-/// What a batch of DOI lookups is for.
+/// What a batch of lookups is for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lookup {
-    /// Typed or pasted DOIs: add straight away (one) or preview (several).
-    Quick { target: Option<i64>, count: usize },
+    /// One typed or pasted identifier: added straight away.
+    Quick { target: Option<i64> },
     /// Results go to the import preview dialog.
     Preview,
-    /// Refresh a paper's metadata from its DOI.
+    /// Refresh a paper's metadata from its DOI, arXiv ID or ISBN.
     Refresh(i64),
 }
 
@@ -89,10 +91,15 @@ pub struct Session {
     pub auto: AutoExport,
     pub md_cache: CommonMarkCache,
     pub quick_doi: String,
+    pub synthesis: Option<crate::ui::synthesis::SynthesisPage>,
     pub settings_form: SettingsForm,
     pub archived_open: bool,
     /// Set by the UI when something needs the time (autosave), read in `logic`.
     pub now: f64,
+    /// A widget had keyboard focus at the end of the last frame. egui drops
+    /// focus on Esc before the app sees the key, so "was the user typing?"
+    /// has to be asked of the previous frame.
+    pub had_focus: bool,
 }
 
 pub enum Screen {
@@ -148,9 +155,11 @@ impl Session {
             toast: None,
             md_cache: CommonMarkCache::default(),
             quick_doi: String::new(),
+            synthesis: None,
             settings_form,
             archived_open: false,
             now: 0.0,
+            had_focus: false,
         };
         s.refresh_cache();
         s
@@ -225,6 +234,7 @@ impl Session {
     /// Goes to a top-level view (from the sidebar): forgets the back stack.
     pub fn go(&mut self, view: View) {
         self.flush_page(true);
+        self.leave_synthesis();
         self.back.clear();
         if self.view != view {
             self.list.selected.clear();
@@ -236,10 +246,11 @@ impl Session {
     pub fn open_paper(&mut self, id: i64) {
         self.flush_page(true);
         let context = match &self.view {
-            View::List(Scope::Collection(c)) | View::Matrix(Scope::Collection(c)) => Some(*c),
+            View::List(Scope::Collection(c)) | View::Matrix(Scope::Collection(c)) | View::Synthesis(c) => Some(*c),
             View::Paper(_) => self.page.as_ref().and_then(|p| p.context),
             _ => None,
         };
+        self.leave_synthesis();
         match PaperPage::load(&self.lib, id, context) {
             Ok(page) => {
                 if !matches!(self.view, View::Paper(p) if p == id) {
@@ -254,6 +265,7 @@ impl Session {
 
     pub fn go_back(&mut self) {
         self.flush_page(true);
+        self.leave_synthesis();
         let view = self.back.pop().unwrap_or(View::Home);
         self.page = None;
         if let View::Paper(id) = view {
@@ -280,40 +292,79 @@ impl Session {
     /// The collection new papers go to: the one on screen, if any.
     pub fn current_collection(&self) -> Option<i64> {
         match &self.view {
-            View::List(Scope::Collection(c)) | View::Matrix(Scope::Collection(c)) => Some(*c),
+            View::List(Scope::Collection(c)) | View::Matrix(Scope::Collection(c)) | View::Synthesis(c) => Some(*c),
             View::Paper(_) => self.page.as_ref().and_then(|p| p.context),
             _ => None,
         }
     }
 
-    /// Looks up the DOIs in `text`. One DOI is added straight away; several
-    /// open the import preview.
-    pub fn lookup_dois(&mut self, ctx: &egui::Context, text: &str, target: Option<i64>) -> bool {
-        let dois = import::doi::find_all(text);
-        if dois.is_empty() {
-            self.error("No DOI found. A DOI looks like 10.1109/TAP.2025.3603900.");
+    /// Looks up the identifiers (DOIs, arXiv IDs, ISBNs, PubMed IDs) in
+    /// `text`. One is added straight away; several open the import preview.
+    pub fn lookup_ids(&mut self, ctx: &egui::Context, text: &str, target: Option<i64>) -> bool {
+        // Paths of files (e.g. copied in a file manager) are added as files.
+        let files = file_paths(text);
+        if !files.is_empty() {
+            self.add_files(ctx, files);
+            return true;
+        }
+        let ids = import::ident::find_all(text);
+        if ids.is_empty() {
+            self.error("No identifier found. Paste a DOI (10.1109/…), an arXiv ID (2301.12345), an ISBN or a PubMed ID.");
             return false;
         }
-        let count = dois.len();
-        let batch = self.net.fetch(ctx, dois, self.settings.contact_email.clone());
+        let count = ids.len();
+        let what = ids[0].kind();
+        let jobs = ids.into_iter().map(Job::Id).collect();
+        let batch = self.net.run(ctx, jobs, self.settings.contact_email.clone());
         if count == 1 {
-            self.lookups.insert(batch, Lookup::Quick { target, count });
-            self.info("Looking up the DOI…");
+            self.lookups.insert(batch, Lookup::Quick { target });
+            self.info(format!("Looking up the {what}…"));
         } else {
             self.lookups.insert(batch, Lookup::Preview);
-            let mut state = ImportState::new(format!("{count} DOIs"), None, target, self.settings.keep_readable_keys);
+            let mut state = self.new_import(format!("{count} identifiers"), None, target);
             state.pending = Some((batch, count));
             self.dialog = Some(Dialog::Import(state));
         }
         true
     }
 
+    /// Reads PDFs, finds which papers they are, and opens the import preview.
+    /// Each paper keeps a link to its PDF.
+    pub fn import_pdfs(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>, target: Option<i64>) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        let jobs = paths.into_iter().map(Job::Pdf).collect();
+        let batch = self.net.run(ctx, jobs, self.settings.contact_email.clone());
+        self.lookups.insert(batch, Lookup::Preview);
+        let mut state = self.new_import(crate::ui::sidebar::plural(count, "PDF"), None, target);
+        state.pending = Some((batch, count));
+        state.reading_pdfs = true;
+        self.dialog = Some(Dialog::Import(state));
+    }
+
+    pub fn pick_pdfs(&mut self, ctx: &egui::Context) {
+        let target = self.current_collection();
+        let mut dialog = rfd::FileDialog::new().set_title("Add papers from their PDFs").add_filter("PDF", &["pdf"]);
+        if let Some(folder) = &self.settings.pdf_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        if let Some(paths) = dialog.pick_files() {
+            self.import_pdfs(ctx, paths, target);
+        }
+    }
+
+    fn new_import(&self, source: String, base_dir: Option<PathBuf>, target: Option<i64>) -> ImportState {
+        ImportState::new(source, base_dir, target, self.settings.keep_readable_keys)
+    }
+
     fn handle_net(&mut self) {
         for msg in self.net.poll() {
             match msg {
-                NetMsg::Fetched { batch, doi, result } => match self.lookups.get(&batch).cloned() {
-                    Some(Lookup::Quick { target, .. }) => match result {
-                        Ok(paper) => self.add_single(paper, target),
+                NetMsg::Fetched { batch, label, result } => match self.lookups.get(&batch).cloned() {
+                    Some(Lookup::Quick { target }) => match result {
+                        Ok(found) => self.add_single(found.paper, target),
                         Err(e) => self.error(e),
                     },
                     Some(Lookup::Preview) => {
@@ -321,8 +372,8 @@ impl Session {
                             && state.pending.is_some_and(|(b, _)| b == batch)
                         {
                             match result {
-                                Ok(paper) => state.candidates.push(Candidate::new(paper)),
-                                Err(e) => state.errors.push(format!("{doi}: {e}")),
+                                Ok(found) => state.candidates.push(Candidate::found(found)),
+                                Err(e) => state.errors.push(format!("{label}: {e}")),
                             }
                             if let Some((_, left)) = &mut state.pending {
                                 *left = left.saturating_sub(1);
@@ -331,12 +382,12 @@ impl Session {
                         }
                     }
                     Some(Lookup::Refresh(id)) => match result {
-                        Ok(paper) => {
+                        Ok(found) => {
                             if let Some(page) = &mut self.page
                                 && page.id == id
                             {
-                                page.apply_lookup(paper.bib);
-                                self.info("Metadata filled in from the DOI. Review it and press Save.");
+                                page.apply_lookup(found.paper.bib);
+                                self.info(format!("Details filled in from {label}. Review them and press Save."));
                             }
                         }
                         Err(e) => self.error(e),
@@ -387,12 +438,7 @@ impl Session {
         match import::read_file(path) {
             Ok((format, parsed)) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let mut state = ImportState::new(
-                    format!("{name} ({})", format.label()),
-                    path.parent().map(Path::to_path_buf),
-                    target,
-                    self.settings.keep_readable_keys,
-                );
+                let mut state = self.new_import(format!("{name} ({})", format.label()), path.parent().map(Path::to_path_buf), target);
                 state.errors = parsed.errors;
                 state.candidates = parsed.papers.into_iter().map(Candidate::new).collect();
                 state.refresh(&self.lib, &self.settings.citekey_pattern);
@@ -423,7 +469,7 @@ impl Session {
         match import::zotero::read(dir) {
             Ok(zotero) => {
                 let source = format!("Zotero ({})", dir.display());
-                let mut state = ImportState::new(source, None, target, self.settings.keep_readable_keys);
+                let mut state = self.new_import(source, None, target);
                 if zotero.without_pdf > 0 {
                     let items = crate::ui::sidebar::plural(zotero.without_pdf, "other item");
                     state.note = Some(format!("Only papers with a downloaded PDF are imported. Left out: {items} in Zotero."));
@@ -620,10 +666,13 @@ impl Session {
                 View::List(scope) => self.list_ui(ui, scope),
                 View::Paper(_) => self.paper_ui(ui),
                 View::Matrix(scope) => self.matrix_ui(ui, scope),
+                View::Synthesis(id) => self.synthesis_ui(ui, id),
                 View::Settings => self.settings_ui(ui),
             });
         self.dialogs(ui);
         self.toast_ui(ui);
+        self.drop_hint(ui);
+        self.had_focus = ui.memory(|m| m.focused().is_some());
     }
 
     pub fn logic(&mut self, ctx: &egui::Context) {
@@ -631,12 +680,15 @@ impl Session {
         self.now = now;
         self.handle_net();
         self.flush_page(false);
+        self.flush_synthesis(false);
         self.auto_export(now);
-        if self.page.as_ref().is_some_and(|p| p.has_unsaved()) || self.auto.pending_since.is_some() {
+        let unsaved = self.page.as_ref().is_some_and(|p| p.has_unsaved()) || self.synthesis.as_ref().is_some_and(|s| s.has_unsaved());
+        if unsaved || self.auto.pending_since.is_some() {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
         if ctx.input(|i| i.viewport().close_requested()) {
             self.flush_page(true);
+            self.flush_synthesis(true);
             if self.settings.auto_export && self.lib.revision() != self.auto.done_rev {
                 let r = self.run_auto_export();
                 self.check(r);
@@ -644,18 +696,56 @@ impl Session {
         }
     }
 
+    /// Keyboard shortcuts (the list is in [`crate::ui::dialogs`], shown with F1).
     fn shortcuts(&mut self, ui: &mut Ui) {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            match self.dialog {
+                Some(Dialog::Shortcuts) => self.dialog = None,
+                None => self.dialog = Some(Dialog::Shortcuts),
+                _ => {}
+            }
+        }
+        if let (View::Paper(_), Some(page)) = (&self.view, &mut self.page) {
+            page.handle_tab(ui, self.dialog.is_none());
+        }
+        // Dialogs handle their own keys (Esc closes them, Ctrl+Enter confirms some).
         if self.dialog.is_some() {
             return;
         }
-        let (esc, find) = ui.input(|i| {
-            (i.key_pressed(egui::Key::Escape), i.modifiers.command && i.key_pressed(egui::Key::F))
-        });
-        let typing = ui.ctx().memory(|m| m.focused().is_some());
-        if esc && !typing && matches!(self.view, View::Paper(_)) {
-            self.go_back();
+        let ctx = ui.ctx().clone();
+        let focused = ctx.memory(|m| m.focused());
+        // Ctrl+Enter: stop editing the field (a filled-in note shows formatted).
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
+            && let Some(id) = focused
+        {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+            if let Some(page) = &mut self.page {
+                page.finish_editing(id);
+            }
+            self.flush_page(true);
+            self.flush_synthesis(true);
         }
-        if find {
+        let trash = |i: &mut egui::InputState| {
+            let m = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+            i.consume_key(m, egui::Key::Delete) || i.consume_key(m, egui::Key::Backspace)
+        };
+        if let View::Paper(id) = self.view
+            && !self.had_focus
+            && focused.is_none()
+            && ui.input_mut(trash)
+        {
+            if self.page.as_ref().is_some_and(|p| p.paper.deleted) {
+                self.info("This paper is already in the Trash.");
+            } else {
+                self.dialog = Some(Dialog::ConfirmTrash(id));
+            }
+        }
+        // Esc: the first one leaves a field (egui does that), the next goes back a level.
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc && !self.had_focus && focused.is_none() && !egui::Popup::is_any_open(&ctx) {
+            self.escape();
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             if !matches!(self.view, View::List(_)) {
                 self.go(View::List(Scope::All));
             }
@@ -663,24 +753,102 @@ impl Session {
         }
     }
 
-    /// PDFs dropped on a paper are linked; reference files are imported.
-    fn handle_dropped_files(&mut self, ui: &mut Ui) {
-        let dropped: Vec<PathBuf> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        for path in dropped {
-            let is_pdf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
-            if is_pdf {
-                match &self.view {
-                    View::Paper(id) => {
-                        let id = *id;
-                        self.attach_pdf(id, &path);
-                    }
-                    _ => self.info("Open a paper first, then drop its PDF on it."),
-                }
-            } else {
-                let target = self.current_collection();
-                self.import_file(&path, target);
+    /// Esc: from a paper back to where it was opened, from a matrix or
+    /// synthesis to its list, from a list (with nothing selected) to Home.
+    pub fn escape(&mut self) {
+        match self.view.clone() {
+            View::Paper(_) => self.go_back(),
+            View::Matrix(scope) => self.go(View::List(scope)),
+            View::Synthesis(c) => self.go(View::List(Scope::Collection(c))),
+            View::List(_) if !self.list.selected.is_empty() => self.list.selected.clear(),
+            View::List(_) | View::Settings => self.go(View::Home),
+            View::Home => {}
+        }
+    }
+
+    /// Moves the paper on screen to the Trash and goes back.
+    pub fn trash_open_paper(&mut self, id: i64) {
+        let r = self.lib.trash(&[id]);
+        if self.check(r).is_some() {
+            self.info("Moved to the Trash. It can be restored from there.");
+            if self.view == View::Paper(id) {
+                self.go_back();
             }
         }
+    }
+
+    /// A PDF dropped on an open paper is linked to it. Other PDFs (and
+    /// folders of them) are imported as papers; reference files are imported.
+    fn handle_dropped_files(&mut self, ui: &mut Ui) {
+        let mut dropped: Vec<PathBuf> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        // Files copied in a file manager and pasted (Ctrl+V) with no field
+        // focused: the same as dropping them. Works where dropping can't (Wayland).
+        if !self.had_focus && self.dialog.is_none() && ui.memory(|m| m.focused().is_none()) {
+            let pasted: Vec<String> = ui.input(|i| {
+                i.events.iter().filter_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }).collect()
+            });
+            for text in pasted {
+                dropped.extend(file_paths(&text));
+            }
+        }
+        self.add_files(ui.ctx(), dropped);
+    }
+
+    /// Files dropped or pasted: PDFs become papers (one on an open paper is
+    /// linked to it), folders are searched for PDFs, reference files imported.
+    pub fn add_files(&mut self, ctx: &egui::Context, dropped: Vec<PathBuf>) {
+        if dropped.is_empty() {
+            return;
+        }
+        let is_pdf = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+        let mut pdfs = Vec::new();
+        let mut others = Vec::new();
+        let mut folders = false;
+        for path in dropped {
+            if path.is_dir() {
+                folders = true;
+                pdfs.extend(pdfs_in(&path));
+            } else if is_pdf(&path) {
+                pdfs.push(path);
+            } else {
+                others.push(path);
+            }
+        }
+        let target = self.current_collection();
+        if let (View::Paper(id), [one], false) = (&self.view, pdfs.as_slice(), folders) {
+            let (id, one) = (*id, one.clone());
+            self.attach_pdf(id, &one);
+        } else if !pdfs.is_empty() {
+            self.import_pdfs(ctx, pdfs, target);
+        } else if folders && others.is_empty() {
+            self.error("No PDFs found in that folder.");
+        }
+        for path in others {
+            self.import_file(&path, target);
+        }
+    }
+
+    /// While files are dragged over the window: what dropping them will do.
+    /// Home has its own drop zone, which lights up instead.
+    fn drop_hint(&self, ui: &mut Ui) {
+        let hovered: Vec<PathBuf> = ui.input(|i| i.raw.hovered_files.iter().filter_map(|f| f.path.clone()).collect());
+        let any = ui.input(|i| !i.raw.hovered_files.is_empty());
+        if !any || (self.view == View::Home && self.dialog.is_none()) {
+            return;
+        }
+        let pdfs = hovered.iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))).count();
+        let text = match (&self.view, pdfs, hovered.len()) {
+            (View::Paper(_), 1, 1) => "Drop to link this PDF to the paper".to_string(),
+            (_, n, total) if n > 0 && n == total => format!("Drop to add {} from {}", if n == 1 { "the paper" } else { "the papers" }, if n == 1 { "its PDF" } else { "their PDFs" }),
+            _ => "Drop PDFs to add papers from them, or a .bib, .ris or .json file to import it".to_string(),
+        };
+        let rect = ui.ctx().content_rect();
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop-hint")));
+        let t = theme::t(ui);
+        painter.rect_filled(rect, 0.0, t.sidebar.gamma_multiply(0.85));
+        painter.rect_stroke(rect.shrink(16.0), egui::CornerRadius::same(18), egui::Stroke::new(2.5, t.accent), egui::StrokeKind::Inside);
+        painter.text(rect.center() - egui::vec2(0.0, 26.0), egui::Align2::CENTER_CENTER, icons::FILE_PDF, egui::FontId::proportional(46.0), t.accent);
+        painter.text(rect.center() + egui::vec2(0.0, 22.0), egui::Align2::CENTER_CENTER, text, theme::semibold_font(19.0), t.ink);
     }
 
     fn toast_ui(&mut self, ui: &mut Ui) {
@@ -730,6 +898,68 @@ impl Session {
     pub fn papers_with_tag(&self, tag: i64) -> HashSet<i64> {
         self.lib.papers_with_tag(tag).unwrap_or_default()
     }
+}
+
+/// The files in pasted text: one absolute path or file:// URI per line,
+/// each of which exists. Anything else in the text means it isn't a file list.
+pub fn file_paths(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let raw = match line.strip_prefix("file://") {
+            // file:///home/… (or file://localhost/home/…), percent-encoded.
+            Some(rest) => percent_decode(rest.strip_prefix("localhost").unwrap_or(rest)),
+            None => line.trim_matches(|c| c == '"' || c == '\'').to_string(),
+        };
+        // Windows URIs look like file:///C:/Papers/x.pdf.
+        let raw = match raw.as_bytes() {
+            [b'/', d, b':', ..] if d.is_ascii_alphabetic() && cfg!(windows) => raw[1..].to_string(),
+            _ => raw,
+        };
+        let path = PathBuf::from(&raw);
+        if !path.is_absolute() || !path.exists() {
+            return Vec::new();
+        }
+        out.push(path);
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = s.get(i + 1..i + 3)
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The PDFs in a folder and its sub-folders (at most 500).
+fn pdfs_in(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) && out.len() < 500 {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 pub fn safe_file_name(s: &str) -> String {

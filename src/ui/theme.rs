@@ -9,7 +9,7 @@ use egui::{
     RichText, Sense, Shadow, Stroke, TextStyle, Theme, ThemePreference, Ui, Vec2, Visuals, WidgetInfo,
 };
 
-use crate::model::ReadingStatus;
+use crate::model::{Decision, ReadingStatus};
 use crate::settings::{Settings, ThemeMode};
 use crate::ui::icons;
 
@@ -158,6 +158,21 @@ const SEMIBOLD: &str = "semibold";
 const SERIF: &str = "serif";
 
 /// The app version shown in the sidebar, e.g. "v0.1.0".
+/// Icon and colour of a screening decision.
+pub fn decision_style(d: Decision) -> (&'static str, Color32) {
+    match d {
+        Decision::Undecided => (icons::CIRCLE_DASHED, SLATE),
+        Decision::Include => (icons::CHECK_CIRCLE, GREEN),
+        Decision::Maybe => (icons::QUESTION, AMBER),
+        Decision::Exclude => (icons::X_CIRCLE, RED),
+    }
+}
+
+pub fn decision_chip(ui: &mut Ui, d: Decision) -> Response {
+    let (icon, colour) = decision_style(d);
+    chip(ui, format!("{icon} {}", d.label()), colour)
+}
+
 pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Inter for text, DM Serif Display for titles and Phosphor for icons, in
@@ -430,6 +445,61 @@ pub fn icon_badge(ui: &mut Ui, icon: &str, color: Color32, size: f32) -> Respons
     resp
 }
 
+/// A row that is one big click target: hovering anywhere on it highlights
+/// it, and its text can't be selected (so a click never starts a selection).
+pub fn clickable_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> Response {
+    let background = ui.painter().add(egui::Shape::Noop);
+    let resp = ui
+        .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
+            ui.style_mut().interaction.selectable_labels = false;
+            ui.set_min_width(ui.available_width());
+            add(ui);
+        })
+        .response;
+    if resp.hovered() {
+        let rect = resp.rect.expand2(egui::vec2(6.0, 3.0));
+        ui.painter().set(background, egui::Shape::rect_filled(rect, CornerRadius::same(8), t(ui).hover));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A dashed box to drop files on (and click to choose them). `active`
+/// lights it up while files are dragged over the window.
+pub fn drop_zone(ui: &mut Ui, size: Vec2, active: bool, title: &str, subtitle: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, true, title));
+    let tones = t(ui);
+    let hot = active || resp.hovered();
+    let colour = if hot { tones.accent } else { tones.muted };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(12), if active { tones.soft } else if hot { tones.hover } else { Color32::TRANSPARENT });
+    if active {
+        painter.rect_stroke(rect, CornerRadius::same(12), Stroke::new(2.0, colour), egui::StrokeKind::Inside);
+    } else {
+        // Dashed outline (square corners keep the dashes simple).
+        let r = rect.shrink(1.0);
+        let path = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+        painter.extend(egui::Shape::dashed_line(&path, Stroke::new(1.3, colour), 6.0, 4.0));
+    }
+    let icon_size = (size.y * 0.32).clamp(18.0, 30.0);
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + size.y * 0.3),
+        Align2::CENTER_CENTER,
+        icons::FILE_PDF,
+        FontId::proportional(icon_size),
+        colour,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + size.y * 0.62),
+        Align2::CENTER_CENTER,
+        title,
+        semibold_font(14.0),
+        if active { tones.accent } else { tones.ink },
+    );
+    painter.text(egui::pos2(rect.center().x, rect.top() + size.y * 0.83), Align2::CENTER_CENTER, subtitle, FontId::proportional(11.5), tones.muted);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A small coloured dot (collection colours).
 pub fn dot(ui: &mut Ui, color: Color32, size: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -668,7 +738,11 @@ mod tests {
             include_str!("matrix.rs"),
             include_str!("dialogs.rs"),
             include_str!("settings.rs"),
+            include_str!("synthesis.rs"),
             include_str!("../db/fields.rs"),
+            include_str!("../import/pdf.rs"),
+            include_str!("../import/lookup.rs"),
+            include_str!("../export/outline.rs"),
         ];
         for font in [FontId::proportional(14.0), semibold_font(14.0), FontId::new(14.0, FontFamily::Name(SERIF.into()))] {
             let mut missing: Vec<char> = sources

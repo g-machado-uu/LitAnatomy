@@ -9,26 +9,39 @@ use egui_commonmark::CommonMarkViewer;
 use crate::app::{Lookup, Session, View};
 use crate::db::{Library, LinkView, Scope};
 use crate::export::bibtex;
+use crate::import::ident::{self, Identifier};
 use crate::import::{doi, names, parse_year};
 use crate::model::{
-    Biblio, Field, FieldKind, Metric, Paper, Quote, ReadingStatus, Relation, authors_long, json_or_empty,
-    parse_metrics, parse_quotes,
+    Biblio, Criterion, CriterionKind, Decision, Field, FieldKind, Metric, Paper, Quote, ReadingStatus, Relation,
+    Screening, authors_long, json_or_empty, parse_metrics, parse_quotes,
 };
+use crate::net::Job;
 use crate::ui::sidebar::plural;
 use crate::ui::{icons, theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaperTab {
     Anatomy,
+    Screening,
     Metadata,
     Links,
     Bibtex,
+}
+
+/// Where Tab can go on the Anatomy tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabStop {
+    Editor(egui::Id),
+    /// A note shown formatted: Tab opens its editor.
+    Formatted(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Dirty {
     Field(i64),
     Relevance(i64),
+    /// The screening note in a review collection.
+    Screening(i64),
 }
 
 /// The metadata form's text, saved with an explicit button.
@@ -58,6 +71,14 @@ impl MetaForm {
             key: p.citekey.clone(),
             dirty: false,
         }
+    }
+
+    /// What "Fill in" looks up: the DOI, else the arXiv ID, else the ISBN.
+    fn lookup_id(&self) -> Option<Identifier> {
+        doi::normalise(&self.doi)
+            .map(Identifier::Doi)
+            .or_else(|| ident::arxiv_id(&self.bib.arxiv_id).map(Identifier::Arxiv))
+            .or_else(|| ident::isbn(&self.bib.isbn).map(Identifier::Isbn))
     }
 
     /// The form as bibliographic data, or what is wrong with it.
@@ -111,6 +132,18 @@ pub struct PaperPage {
     pub links: Vec<LinkView>,
     pub link_form: LinkForm,
     pub rating: u8,
+    /// (review collection, the paper's screening there), for collections that screen.
+    pub screening: Vec<(i64, Screening)>,
+    /// Criteria of those collections.
+    pub criteria: HashMap<i64, Vec<Criterion>>,
+    /// The synthesis themes it is in: (collection, theme).
+    pub themes: Vec<(i64, String)>,
+    /// The Anatomy tab's text editors, as last drawn: (field position, order within it, stop).
+    tab_stops: Vec<(usize, usize, TabStop)>,
+    /// The field each Anatomy editor belongs to.
+    editor_field: HashMap<egui::Id, i64>,
+    /// A field opened by Tab from its formatted view: its editor takes focus when drawn.
+    focus_field: Option<i64>,
 }
 
 /// Navigation asked for while drawing a page, done once it's drawn.
@@ -118,6 +151,9 @@ enum PageAction {
     Back,
     Open(i64),
     Collection(i64),
+    /// The next paper to screen in a review, keeping the Screening tab open.
+    Screen(i64),
+    Synthesis(i64),
 }
 
 const ENTRY_TYPES: &[(&str, &str)] = &[
@@ -163,8 +199,15 @@ impl PaperPage {
             tag_input: String::new(),
             links: lib.links_of(id)?,
             link_form: LinkForm::default(),
+            screening: Vec::new(),
+            criteria: HashMap::new(),
+            themes: lib.themes_of(id)?,
+            tab_stops: Vec::new(),
+            editor_field: HashMap::new(),
+            focus_field: None,
         };
         page.load_fields(lib)?;
+        page.load_screening(lib)?;
         // Filled-in long fields start as formatted text; empty ones as editors.
         page.preview = page
             .fields
@@ -203,6 +246,31 @@ impl PaperPage {
         Ok(())
     }
 
+    /// The paper's screening in each review collection it is in (the context first).
+    fn load_screening(&mut self, lib: &Library) -> Result<()> {
+        let reviews: Vec<i64> = lib
+            .collections()?
+            .into_iter()
+            .filter(|c| c.screening && self.relevance.iter().any(|(m, _)| *m == c.id))
+            .map(|c| c.id)
+            .collect();
+        let mut screening = Vec::new();
+        for c in reviews {
+            let mut s = lib.screening(c, self.id)?.unwrap_or_default();
+            // Keep a note still being typed.
+            if self.dirty.contains_key(&Dirty::Screening(c))
+                && let Some((_, old)) = self.screening.iter().find(|(o, _)| *o == c)
+            {
+                s.note = old.note.clone();
+            }
+            self.criteria.insert(c, lib.criteria(c)?);
+            screening.push((c, s));
+        }
+        screening.sort_by_key(|(c, _)| Some(*c) != self.context);
+        self.screening = screening;
+        Ok(())
+    }
+
     /// After a change elsewhere: reload the metadata, keep what is being typed.
     pub fn reload_meta(&mut self, lib: &Library) {
         let Ok(paper) = lib.paper(self.id) else { return };
@@ -230,11 +298,88 @@ impl PaperPage {
         if let Ok(links) = lib.links_of(self.id) {
             self.links = links;
         }
+        if let Ok(themes) = lib.themes_of(self.id) {
+            self.themes = themes;
+        }
         let _ = self.load_fields(lib);
+        let _ = self.load_screening(lib);
+        if self.tab == PaperTab::Screening && self.screening.is_empty() {
+            self.tab = PaperTab::Anatomy;
+        }
     }
 
     pub fn has_unsaved(&self) -> bool {
         !self.dirty.is_empty()
+    }
+
+    /// Ctrl+Enter in an editor: a filled-in long note goes back to showing formatted.
+    pub fn finish_editing(&mut self, editor: egui::Id) {
+        let Some(&fid) = self.editor_field.get(&editor) else { return };
+        let long = self.fields.iter().any(|f| f.id == fid && f.kind == FieldKind::LongText);
+        if long && self.texts.get(&fid).is_some_and(|t| !t.trim().is_empty()) {
+            self.preview.insert(fid);
+        }
+    }
+
+    fn editor_id(&self, field: i64, part: usize) -> egui::Id {
+        egui::Id::unique(("anatomy-editor", self.id, field, part))
+    }
+
+    /// Records an editor drawn for field `field` at position `pos`, for Tab.
+    fn tab_stop(&mut self, pos: usize, field: i64, stop: TabStop) {
+        let n = self.tab_stops.iter().filter(|(p, _, _)| *p == pos).count();
+        self.tab_stops.push((pos, n, stop));
+        if let TabStop::Editor(id) = stop {
+            self.editor_field.insert(id, field);
+        }
+    }
+
+    /// Focus the editor if Tab asked for this field.
+    fn take_focus(&mut self, ui: &Ui, field: i64, editor: egui::Id) {
+        if self.focus_field == Some(field) {
+            self.focus_field = None;
+            ui.memory_mut(|m| m.request_focus(editor));
+        }
+    }
+
+    /// Tab and Shift+Tab move between the notes' editors in reading order
+    /// (also across the two columns), instead of through every button.
+    /// Called before anything is drawn (egui hands Tab's focus to the first
+    /// widget that asks for it), using the editors drawn last frame.
+    pub fn handle_tab(&mut self, ui: &Ui, keys: bool) {
+        let mut stops = std::mem::take(&mut self.tab_stops);
+        if !keys {
+            return;
+        }
+        stops.sort_by_key(|(pos, n, _)| (*pos, *n));
+        let (next, prev) = ui.input(|i| {
+            let tab = i.key_pressed(egui::Key::Tab);
+            (tab && i.modifiers.is_none(), tab && i.modifiers.shift_only())
+        });
+        if !(next || prev) || stops.is_empty() {
+            return;
+        }
+        let focused = ui.memory(|m| m.focused());
+        let current = focused.and_then(|f| stops.iter().position(|(_, _, s)| *s == TabStop::Editor(f)));
+        let target = match (current, focused) {
+            (Some(i), _) if next => stops.get(i + 1),
+            (Some(i), _) => i.checked_sub(1).and_then(|j| stops.get(j)),
+            (None, None) if next => stops.first(),
+            (None, None) => stops.last(),
+            // The focus is somewhere else, such as the tag box: Tab works as usual there.
+            (None, Some(_)) => return,
+        };
+        // Don't let egui move the focus itself (to the next button).
+        ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        match target.map(|(_, _, s)| *s) {
+            Some(TabStop::Editor(id)) => ui.memory_mut(|m| m.request_focus(id)),
+            Some(TabStop::Formatted(fid)) => {
+                self.preview.remove(&fid);
+                self.focus_field = Some(fid);
+            }
+            // Past the first or last field: stay put.
+            None => {}
+        }
     }
 
     fn touch(&mut self, key: Dirty, now: f64) {
@@ -270,6 +415,11 @@ impl PaperPage {
                     let text = self.relevance.iter().find(|(c, _)| *c == cid).map(|(_, t)| t.clone()).unwrap_or_default();
                     lib.set_relevance(cid, self.id, &text)?;
                 }
+                Dirty::Screening(cid) => {
+                    if let Some((_, s)) = self.screening.iter().find(|(c, _)| *c == cid) {
+                        lib.set_screening(cid, self.id, s)?;
+                    }
+                }
             }
             self.dirty.remove(&key);
         }
@@ -300,12 +450,15 @@ impl Session {
         let mut actions = Vec::new();
         self.paper_header(ui, &mut page, &mut actions);
         ui.add_space(6.0);
-        let tabs = [
-            (PaperTab::Anatomy, format!("{} Anatomy", icons::NOTE_PENCIL)),
+        let mut tabs = vec![(PaperTab::Anatomy, format!("{} Anatomy", icons::NOTE_PENCIL))];
+        if !page.screening.is_empty() {
+            tabs.push((PaperTab::Screening, format!("{} Screening", icons::FUNNEL)));
+        }
+        tabs.extend([
             (PaperTab::Metadata, format!("{} Metadata{}", icons::FILE_TEXT, if page.meta.dirty { " •" } else { "" })),
             (PaperTab::Links, format!("{} Links ({})", icons::GRAPH, page.links.len())),
             (PaperTab::Bibtex, format!("{} BibTeX", icons::BRACKETS_CURLY)),
-        ];
+        ]);
         if let Some(tab) = theme::segmented(ui, page.tab, &tabs) {
             page.tab = tab;
         }
@@ -313,6 +466,7 @@ impl Session {
         egui::ScrollArea::vertical().id_salt(("paper", page.id, page.tab as u8)).auto_shrink(false).show(ui, |ui| {
             match page.tab {
                 PaperTab::Anatomy => self.anatomy_tab(ui, &mut page),
+                PaperTab::Screening => self.screening_tab(ui, &mut page, &mut actions),
                 PaperTab::Metadata => self.metadata_tab(ui, &mut page),
                 PaperTab::Links => self.links_tab(ui, &mut page, &mut actions),
                 PaperTab::Bibtex => self.bibtex_tab(ui, &page),
@@ -331,6 +485,16 @@ impl Session {
                 PageAction::Back => self.go_back(),
                 PageAction::Open(id) => self.open_paper(id),
                 PageAction::Collection(id) => self.go(View::List(Scope::Collection(id))),
+                PageAction::Synthesis(id) => self.go(View::Synthesis(id)),
+                PageAction::Screen(id) => {
+                    // Stay "in" the review: the next paper replaces this one, and Back still goes to the list.
+                    let back = self.back.clone();
+                    self.open_paper(id);
+                    self.back = back;
+                    if let Some(p) = &mut self.page {
+                        p.tab = PaperTab::Screening;
+                    }
+                }
             }
         }
     }
@@ -420,7 +584,26 @@ impl Session {
                 self.check(r);
             }
             ui.add_space(10.0);
+            for (cid, s) in &page.screening {
+                let name = self.collection(*cid).map(|c| c.name.clone()).unwrap_or_default();
+                let (icon, colour) = theme::decision_style(s.decision);
+                if theme::chip_button(ui, format!("{icon} {}", s.decision.label()), colour)
+                    .on_hover_text(format!("Screening in {name}. Click to decide."))
+                    .clicked()
+                {
+                    page.tab = PaperTab::Screening;
+                }
+            }
             self.membership_chips(ui, page, actions);
+            for (cid, name) in &page.themes {
+                let collection = self.collection(*cid).map(|c| c.name.clone()).unwrap_or_default();
+                if theme::chip_button(ui, format!("{} {name}", icons::LIGHTBULB), theme::SLATE)
+                    .on_hover_text(format!("A theme of {collection}'s synthesis. Click to open it."))
+                    .clicked()
+                {
+                    actions.push(PageAction::Synthesis(*cid));
+                }
+            }
             ui.add_space(6.0);
             self.tag_chips(ui, page);
         });
@@ -564,18 +747,18 @@ impl Session {
         if two_columns {
             let (left, right): (Vec<_>, Vec<_>) = visible.iter().enumerate().partition(|(i, _)| i % 2 == 0);
             ui.columns(2, |cols| {
-                for (_, f) in left {
-                    self.field_card(&mut cols[0], page, f);
+                for (pos, f) in left {
+                    self.field_card(&mut cols[0], page, f, pos);
                     cols[0].add_space(10.0);
                 }
-                for (_, f) in right {
-                    self.field_card(&mut cols[1], page, f);
+                for (pos, f) in right {
+                    self.field_card(&mut cols[1], page, f, pos);
                     cols[1].add_space(10.0);
                 }
             });
         } else {
-            for f in &visible {
-                self.field_card(ui, page, f);
+            for (pos, f) in visible.iter().enumerate() {
+                self.field_card(ui, page, f, pos);
                 ui.add_space(10.0);
             }
         }
@@ -588,7 +771,7 @@ impl Session {
         });
     }
 
-    fn field_card(&mut self, ui: &mut Ui, page: &mut PaperPage, f: &Field) {
+    fn field_card(&mut self, ui: &mut Ui, page: &mut PaperPage, f: &Field, pos: usize) {
         let now = self.now;
         theme::card_frame(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -620,10 +803,15 @@ impl Session {
                     }
                 });
             });
+            let editor = page.editor_id(f.id, 0);
             match f.kind {
                 FieldKind::LongText => {
+                    if !page.preview.contains(&f.id) || page.texts.get(&f.id).is_none_or(|t| t.trim().is_empty()) {
+                        page.take_focus(ui, f.id, editor);
+                    }
+                    let previewing = page.preview.contains(&f.id);
                     let text = page.texts.entry(f.id).or_default();
-                    if page.preview.contains(&f.id) && !text.trim().is_empty() {
+                    if previewing && !text.trim().is_empty() {
                         let resp = ui
                             .scope(|ui| {
                                 CommonMarkViewer::new().show(ui, &mut self.md_cache, text);
@@ -633,47 +821,60 @@ impl Session {
                             .on_hover_text("Double-click to edit");
                         if resp.double_clicked() {
                             page.preview.remove(&f.id);
+                            page.focus_field = Some(f.id);
                         }
+                        page.tab_stop(pos, f.id, TabStop::Formatted(f.id));
                     } else {
                         let resp = ui.add(
                             egui::TextEdit::multiline(text)
+                                .id(editor)
                                 .hint_text(&f.prompt)
                                 .desired_rows(3)
-                                .desired_width(f32::INFINITY)
-                                .lock_focus(true),
+                                .desired_width(f32::INFINITY),
                         );
                         if resp.changed() {
                             page.touch(Dirty::Field(f.id), now);
                         }
+                        page.tab_stop(pos, f.id, TabStop::Editor(editor));
                     }
                 }
                 FieldKind::ShortText => {
+                    page.take_focus(ui, f.id, editor);
                     let text = page.texts.entry(f.id).or_default();
-                    if ui.add(egui::TextEdit::singleline(text).hint_text(&f.prompt).desired_width(f32::INFINITY)).changed() {
+                    if ui.add(egui::TextEdit::singleline(text).id(editor).hint_text(&f.prompt).desired_width(f32::INFINITY)).changed() {
                         page.touch(Dirty::Field(f.id), now);
                     }
+                    page.tab_stop(pos, f.id, TabStop::Editor(editor));
                 }
                 FieldKind::Metrics => {
-                    if metrics_editor(ui, page.metrics.entry(f.id).or_default(), f.id) {
+                    let mut editors = Vec::new();
+                    if metrics_editor(ui, page.metrics.entry(f.id).or_default(), editor, &mut editors) {
                         page.touch(Dirty::Field(f.id), now);
+                    }
+                    for e in editors {
+                        page.tab_stop(pos, f.id, TabStop::Editor(e));
                     }
                 }
                 FieldKind::Quotes => {
                     let mut copied = None;
-                    if quotes_editor(ui, page.quotes.entry(f.id).or_default(), f.id, &mut copied) {
+                    let mut editors = Vec::new();
+                    if quotes_editor(ui, page.quotes.entry(f.id).or_default(), editor, &mut copied, &mut editors) {
                         page.touch(Dirty::Field(f.id), now);
+                    }
+                    for e in editors {
+                        page.tab_stop(pos, f.id, TabStop::Editor(e));
                     }
                     if let Some(text) = copied {
                         ui.ctx().copy_text(text);
                         self.info("Quote copied.");
                     }
                 }
-                FieldKind::Relevance => self.relevance_editor(ui, page, f, now),
+                FieldKind::Relevance => self.relevance_editor(ui, page, f, now, pos),
             }
         });
     }
 
-    fn relevance_editor(&mut self, ui: &mut Ui, page: &mut PaperPage, f: &Field, now: f64) {
+    fn relevance_editor(&mut self, ui: &mut Ui, page: &mut PaperPage, f: &Field, now: f64, pos: usize) {
         if page.relevance.is_empty() {
             theme::hint(ui, "Add this paper to a collection (above) to note why it matters for that piece of work.");
             return;
@@ -687,8 +888,10 @@ impl Session {
                 theme::dot(ui, theme::label_colour(c.colour), 10.0);
                 ui.label(RichText::new(&c.name).small().color(theme::muted(ui)));
             });
+            let editor = page.editor_id(f.id, i);
             let resp = ui.add(
                 egui::TextEdit::multiline(&mut page.relevance[i].1)
+                    .id(editor)
                     .hint_text(&f.prompt)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY),
@@ -696,7 +899,121 @@ impl Session {
             if resp.changed() {
                 page.touch(Dirty::Relevance(cid), now);
             }
+            page.tab_stop(pos, f.id, TabStop::Editor(editor));
         }
+    }
+
+    // ----- Screening -------------------------------------------------------
+
+    fn screening_tab(&mut self, ui: &mut Ui, page: &mut PaperPage, actions: &mut Vec<PageAction>) {
+        let now = self.now;
+        if !page.paper.bib.abstract_.trim().is_empty() {
+            theme::card(ui, "Abstract", |ui| {
+                ui.add(egui::Label::new(&page.paper.bib.abstract_).wrap());
+                if !page.paper.bib.keywords.trim().is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("{} {}", icons::TAG, page.paper.bib.keywords)).small().color(theme::muted(ui)));
+                }
+            });
+            ui.add_space(10.0);
+        } else {
+            theme::hint(ui, "No abstract: screen by the title, or open the PDF. \"Fill in from DOI\" on the Metadata tab may find one.");
+            ui.add_space(6.0);
+        }
+        for i in 0..page.screening.len() {
+            let cid = page.screening[i].0;
+            let Some(collection) = self.collection(cid).cloned() else { continue };
+            let criteria = page.criteria.get(&cid).cloned().unwrap_or_default();
+            let mut save = false;
+            let mut next = false;
+            theme::card(ui, &format!("Screening for {}", collection.name), |ui| {
+                let s = &mut page.screening[i].1;
+                let options: Vec<(Decision, String)> =
+                    Decision::ALL.iter().map(|d| (*d, format!("{} {}", theme::decision_style(*d).0, d.verb()))).collect();
+                ui.horizontal(|ui| {
+                    if let Some(d) = theme::segmented(ui, s.decision, &options) {
+                        s.decision = d;
+                        s.decided_at = None;
+                        save = true;
+                    }
+                    if let Some(at) = s.decided_at.as_deref().filter(|_| s.decision != Decision::Undecided) {
+                        ui.label(RichText::new(format!("decided {}", at.replace('T', " at "))).small().color(theme::muted(ui)));
+                    }
+                });
+                if criteria.is_empty() {
+                    theme::hint(ui, "This review has no criteria yet. Add inclusion and exclusion criteria in the collection's settings.");
+                }
+                for kind in [CriterionKind::Include, CriterionKind::Exclude] {
+                    let mine: Vec<&Criterion> = criteria.iter().filter(|c| c.kind == kind).collect();
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(6.0);
+                    let title = match kind {
+                        CriterionKind::Include => "Inclusion criteria it meets",
+                        CriterionKind::Exclude => "Exclusion criteria that apply",
+                    };
+                    ui.label(theme::semibold(title).size(13.0));
+                    for (n, c) in mine.iter().enumerate() {
+                        let mut on = s.criteria.contains(&c.id);
+                        let text = format!("{}{}  {}", kind.prefix(), n + 1, c.label);
+                        if ui.checkbox(&mut on, text).changed() {
+                            if on {
+                                s.criteria.push(c.id);
+                                // Ticking a reason to exclude is deciding to exclude.
+                                if kind == CriterionKind::Exclude && matches!(s.decision, Decision::Undecided | Decision::Maybe) {
+                                    s.decision = Decision::Exclude;
+                                    s.decided_at = None;
+                                }
+                            } else {
+                                s.criteria.retain(|x| *x != c.id);
+                            }
+                            save = true;
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut s.note)
+                        .hint_text("Reason or note, e.g. \"simulation only, no measurements\"")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.changed() {
+                    page.dirty.insert(Dirty::Screening(cid), now);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button(ui, format!("Next paper to screen {}", icons::ARROW_RIGHT))).on_hover_text("The next paper in this collection not screened yet").clicked() {
+                        next = true;
+                    }
+                    let left = self.lib.screenings(cid).map(|all| all.iter().filter(|(p, s)| **p != page.id && s.decision == Decision::Undecided).count()).unwrap_or(0);
+                    ui.label(RichText::new(format!("{} left to screen", plural(left, "paper"))).small().color(theme::muted(ui)));
+                });
+            });
+            if save {
+                let s = page.screening[i].1.clone();
+                page.dirty.remove(&Dirty::Screening(cid));
+                let r = self.lib.set_screening(cid, page.id, &s);
+                self.check(r);
+            }
+            if next {
+                match self.next_to_screen(cid, page.id) {
+                    Some(id) => actions.push(PageAction::Screen(id)),
+                    None => self.info(format!("Every paper in {} has been screened.", collection.name)),
+                }
+            }
+            ui.add_space(10.0);
+        }
+    }
+
+    /// The next unscreened paper of a review after `current`, in the list's order.
+    fn next_to_screen(&self, collection: i64, current: i64) -> Option<i64> {
+        let rows = self.lib.rows(Scope::Collection(collection)).ok()?;
+        let all = self.lib.screenings(collection).ok()?;
+        let undecided = |id: &i64| all.get(id).is_some_and(|s| s.decision == Decision::Undecided);
+        let pos = rows.iter().position(|r| r.id == current).unwrap_or(0);
+        rows.iter().skip(pos + 1).chain(rows.iter().take(pos)).map(|r| r.id).find(|id| *id != current && undecided(id))
     }
 
     // ----- Metadata --------------------------------------------------------
@@ -768,12 +1085,19 @@ impl Session {
                 ui.horizontal(|ui| {
                     changed |= ui.add(egui::TextEdit::singleline(&mut m.doi).hint_text("10.xxxx/…").desired_width(260.0)).changed();
                     let busy = self.lookups.values().any(|l| *l == Lookup::Refresh(page.id));
-                    let can = doi::normalise(&m.doi).is_some() && !busy;
-                    let label = if busy { format!("{} Looking up…", icons::CLOCK) } else { format!("{} Fill in from DOI", icons::MAGIC_WAND) };
-                    if ui.add_enabled(can, egui::Button::new(label)).on_hover_text("Replace these details with the publisher's record").clicked()
-                        && let Some(d) = doi::normalise(&m.doi)
+                    let source = m.lookup_id();
+                    let label = match (&source, busy) {
+                        (_, true) => format!("{} Looking up…", icons::CLOCK),
+                        (Some(Identifier::Doi(_)) | None, _) => format!("{} Fill in from DOI", icons::MAGIC_WAND),
+                        (Some(id), _) => format!("{} Fill in from {}", icons::MAGIC_WAND, id.kind()),
+                    };
+                    if ui
+                        .add_enabled(source.is_some() && !busy, egui::Button::new(label))
+                        .on_hover_text("Replace these details with the published record (by DOI, else arXiv ID or ISBN)")
+                        .clicked()
+                        && let Some(id) = source
                     {
-                        let batch = self.net.fetch(ui.ctx(), vec![d], self.settings.contact_email.clone());
+                        let batch = self.net.run(ui.ctx(), vec![Job::Id(id)], self.settings.contact_email.clone());
                         self.lookups.insert(batch, Lookup::Refresh(page.id));
                     }
                 });
@@ -989,19 +1313,22 @@ impl PaperPage {
 }
 
 /// Name / value / unit rows. Returns true if anything changed.
-fn metrics_editor(ui: &mut Ui, metrics: &mut Vec<Metric>, id: i64) -> bool {
+/// `base` names the editors, which are listed in `editors` in Tab order.
+fn metrics_editor(ui: &mut Ui, metrics: &mut Vec<Metric>, base: egui::Id, editors: &mut Vec<egui::Id>) -> bool {
     let mut changed = false;
     let mut remove = None;
     if !metrics.is_empty() {
-        egui::Grid::new(("metrics", id)).num_columns(4).spacing([6.0, 6.0]).show(ui, |ui| {
+        egui::Grid::new(("metrics", base)).num_columns(4).spacing([6.0, 6.0]).show(ui, |ui| {
             ui.label(RichText::new("Name").small().color(theme::muted(ui)));
             ui.label(RichText::new("Value").small().color(theme::muted(ui)));
             ui.label(RichText::new("Unit").small().color(theme::muted(ui)));
             ui.end_row();
             for (i, m) in metrics.iter_mut().enumerate() {
-                changed |= ui.add(egui::TextEdit::singleline(&mut m.name).hint_text("Gain").desired_width(150.0)).changed();
-                changed |= ui.add(egui::TextEdit::singleline(&mut m.value).hint_text("30.8").desired_width(110.0)).changed();
-                changed |= ui.add(egui::TextEdit::singleline(&mut m.unit).hint_text("dB").desired_width(60.0)).changed();
+                let ids = [base.with((i, 0)), base.with((i, 1)), base.with((i, 2))];
+                editors.extend(ids);
+                changed |= ui.add(egui::TextEdit::singleline(&mut m.name).id(ids[0]).hint_text("Gain").desired_width(150.0)).changed();
+                changed |= ui.add(egui::TextEdit::singleline(&mut m.value).id(ids[1]).hint_text("30.8").desired_width(110.0)).changed();
+                changed |= ui.add(egui::TextEdit::singleline(&mut m.unit).id(ids[2]).hint_text("dB").desired_width(60.0)).changed();
                 if ui.add(theme::ghost_button(icons::X)).on_hover_text("Remove").clicked() {
                     remove = Some(i);
                 }
@@ -1020,11 +1347,14 @@ fn metrics_editor(ui: &mut Ui, metrics: &mut Vec<Metric>, id: i64) -> bool {
 }
 
 /// Verbatim quotes with pages. Returns true if anything changed.
-fn quotes_editor(ui: &mut Ui, quotes: &mut Vec<Quote>, id: i64, copied: &mut Option<String>) -> bool {
+/// `base` names the editors, which are listed in `editors` in Tab order.
+fn quotes_editor(ui: &mut Ui, quotes: &mut Vec<Quote>, base: egui::Id, copied: &mut Option<String>, editors: &mut Vec<egui::Id>) -> bool {
     let mut changed = false;
     let mut remove = None;
     for (i, q) in quotes.iter_mut().enumerate() {
-        ui.push_id((id, i), |ui| {
+        let ids = [base.with((i, "page")), base.with((i, "text"))];
+        editors.extend(ids);
+        ui.push_id((base, i), |ui| {
             egui::Frame::new()
                 .fill(theme::t(ui).raised)
                 .corner_radius(egui::CornerRadius::same(8))
@@ -1035,7 +1365,7 @@ fn quotes_editor(ui: &mut Ui, quotes: &mut Vec<Quote>, id: i64, copied: &mut Opt
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icons::QUOTES).color(theme::accent(ui)));
                         ui.label(RichText::new("p.").small().color(theme::muted(ui)));
-                        changed |= ui.add(egui::TextEdit::singleline(&mut q.page).hint_text("12").desired_width(50.0)).changed();
+                        changed |= ui.add(egui::TextEdit::singleline(&mut q.page).id(ids[0]).hint_text("12").desired_width(50.0)).changed();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(theme::ghost_button(icons::X)).on_hover_text("Remove").clicked() {
                                 remove = Some(i);
@@ -1047,7 +1377,7 @@ fn quotes_editor(ui: &mut Ui, quotes: &mut Vec<Quote>, id: i64, copied: &mut Opt
                         });
                     });
                     changed |= ui
-                        .add(egui::TextEdit::multiline(&mut q.text).hint_text("The exact words…").desired_rows(2).desired_width(f32::INFINITY))
+                        .add(egui::TextEdit::multiline(&mut q.text).id(ids[1]).hint_text("The exact words…").desired_rows(2).desired_width(f32::INFINITY))
                         .changed();
                 });
         });

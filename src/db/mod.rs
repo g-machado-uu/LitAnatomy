@@ -6,7 +6,9 @@ mod collections;
 mod fields;
 mod links;
 mod papers;
+mod screening;
 mod search;
+mod synthesis;
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,7 @@ use rusqlite::{Connection, params};
 pub use fields::DEFAULT_FIELDS;
 pub use links::LinkView;
 pub use papers::title_fingerprint;
+pub use screening::ScreeningSummary;
 
 use crate::model::FieldKind;
 
@@ -34,7 +37,7 @@ pub struct Library {
     revision: u64,
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE papers (
@@ -134,6 +137,42 @@ CREATE VIRTUAL TABLE search USING fts5(
 );
 ";
 
+/// v0.2: systematic-review screening and collection synthesis.
+const SCHEMA_V2: &str = "
+ALTER TABLE collections ADD COLUMN screening INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE collections ADD COLUMN synthesis TEXT NOT NULL DEFAULT '';
+ALTER TABLE collections ADD COLUMN outline TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE collection_papers ADD COLUMN decision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE collection_papers ADD COLUMN decision_criteria TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE collection_papers ADD COLUMN decision_note TEXT NOT NULL DEFAULT '';
+ALTER TABLE collection_papers ADD COLUMN decided_at TEXT;
+
+CREATE TABLE criteria (
+    id INTEGER PRIMARY KEY,
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+
+CREATE TABLE themes (
+    id INTEGER PRIMARY KEY,
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL
+);
+
+CREATE TABLE theme_papers (
+    theme_id INTEGER NOT NULL REFERENCES themes(id) ON DELETE CASCADE,
+    paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (theme_id, paper_id)
+);
+CREATE INDEX theme_papers_paper ON theme_papers(paper_id);
+";
+
 impl Library {
     /// Opens (or creates) the library file at `path`.
     pub fn open(path: &Path) -> Result<Self> {
@@ -170,6 +209,8 @@ impl Library {
         Ok(lib)
     }
 
+    /// Brings the file up to [`SCHEMA_VERSION`], one version at a time, each
+    /// step in its own transaction.
     fn migrate(&mut self, from: i64) -> Result<()> {
         if from < 1 {
             let tx = self.conn.transaction()?;
@@ -180,7 +221,13 @@ impl Library {
                     params![key, label, prompt, kind.as_str(), i as i64],
                 )?;
             }
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            tx.execute_batch("PRAGMA user_version = 1;")?;
+            tx.commit()?;
+        }
+        if from < 2 {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch("PRAGMA user_version = 2;")?;
             tx.commit()?;
         }
         Ok(())

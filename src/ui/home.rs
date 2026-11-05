@@ -47,30 +47,73 @@ impl Session {
         });
     }
 
+    /// Paste an identifier, or drop PDFs on the zone on the right.
     fn quick_add(&mut self, ui: &mut Ui) {
+        let dragging = ui.input(|i| !i.raw.hovered_files.is_empty());
         theme::card(ui, "Add a paper", |ui| {
-            ui.horizontal(|ui| {
-                let button_w = 380.0;
-                let edit = egui::TextEdit::singleline(&mut self.quick_doi)
-                    .hint_text("Paste a DOI or a doi.org link, e.g. 10.1109/TAP.2025.3603900")
-                    .desired_width((ui.available_width() - button_w).max(200.0));
-                let resp = ui.add(edit);
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add(theme::primary_button(ui, format!("{} Look up", icons::MAGIC_WAND))).clicked() || enter {
-                    let text = std::mem::take(&mut self.quick_doi);
-                    if !self.lookup_dois(ui.ctx(), &text, None) {
-                        self.quick_doi = text;
+            let zone = egui::vec2((ui.available_width() * 0.32).clamp(220.0, 340.0), 92.0);
+            ui.horizontal_top(|ui| {
+                // Two gaps between the columns: the space and egui's item spacing.
+                let gap = 16.0;
+                let left = ui.available_width() - zone.x - gap - 2.0 * ui.spacing().item_spacing.x;
+                ui.allocate_ui_with_layout(egui::vec2(left, zone.y), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_width(left);
+                    ui.add_space(4.0);
+                    // The buttons sit next to the box; on a narrow window they go below it.
+                    // Look up, Import file… and Zotero… with the spacing between them.
+                    let buttons = 345.0;
+                    let one_row = left - buttons >= 260.0;
+                    let mut go = false;
+                    ui.horizontal(|ui| {
+                        let width = if one_row { left - buttons } else { left };
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.quick_doi)
+                                .hint_text("DOI, arXiv ID, ISBN or PubMed ID")
+                                .desired_width(width),
+                        );
+                        go |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if one_row {
+                            go |= self.quick_add_buttons(ui);
+                        }
+                    });
+                    if !one_row {
+                        ui.horizontal(|ui| go |= self.quick_add_buttons(ui));
                     }
-                }
-                if ui.button(format!("{} Import file…", icons::DOWNLOAD_SIMPLE)).clicked() {
-                    self.pick_import_file();
-                }
-                if ui.button(format!("{} Zotero…", icons::BOOKS)).on_hover_text("Import the papers whose PDFs Zotero has downloaded").clicked() {
-                    self.import_zotero();
+                    if go {
+                        let text = std::mem::take(&mut self.quick_doi);
+                        if !self.lookup_ids(ui.ctx(), &text, None) {
+                            self.quick_doi = text;
+                        }
+                    }
+                    ui.add_space(2.0);
+                    theme::hint(ui, "e.g. 10.1109/TAP.2025.3603900, arXiv:2301.12345 or ISBN 978-0-470-63155-3. Several can be pasted at once.");
+                });
+                ui.add_space(gap);
+                let (title, subtitle) = if dragging {
+                    ("Drop to add the papers", "PDFs, a folder of PDFs, or a .bib, .ris or .json file")
+                } else {
+                    ("Drop PDFs or a folder here", "or click to choose PDFs · Ctrl+V pastes copied files")
+                };
+                if theme::drop_zone(ui, zone, dragging, title, subtitle)
+                    .on_hover_text("Each paper's details are found from its PDF, and the PDF stays linked")
+                    .clicked()
+                {
+                    self.pick_pdfs(ui.ctx());
                 }
             });
-            theme::hint(ui, "Several DOIs can be pasted at once. You can also drop a .bib, .ris or .json file anywhere in the window.");
         });
+    }
+
+    /// Look up, Import file… and Zotero…; returns whether Look up was pressed.
+    fn quick_add_buttons(&mut self, ui: &mut Ui) -> bool {
+        let go = ui.add(theme::primary_button(ui, format!("{} Look up", icons::MAGIC_WAND))).clicked();
+        if ui.button(format!("{} Import file…", icons::DOWNLOAD_SIMPLE)).on_hover_text("BibTeX, BibLaTeX, RIS, RefWorks or CSL-JSON").clicked() {
+            self.pick_import_file();
+        }
+        if ui.button(format!("{} Zotero…", icons::BOOKS)).on_hover_text("Import the papers whose PDFs Zotero has downloaded").clicked() {
+            self.import_zotero();
+        }
+        go
     }
 
     fn stat_row(&mut self, ui: &mut Ui, total: usize, counts: &std::collections::HashMap<ReadingStatus, usize>) {
@@ -122,6 +165,8 @@ impl Session {
                             .corner_radius(egui::CornerRadius::same(12))
                             .inner_margin(egui::Margin::same(14))
                             .show(ui, |ui| ui.vertical(|ui| {
+                                // Not selectable: a click anywhere opens the collection.
+                                ui.style_mut().interaction.selectable_labels = false;
                                 ui.set_width(card_w - 28.0);
                                 ui.horizontal(|ui| {
                                     theme::dot(ui, colour, 12.0);
@@ -169,8 +214,8 @@ impl Session {
                 return;
             }
             for r in recent {
-                let resp = ui
-                    .horizontal(|ui| {
+                let resp = theme::clickable_row(ui, |ui| {
+                    ui.horizontal(|ui| {
                         let (icon, colour) = theme::status_style(r.status);
                         ui.label(RichText::new(icon).size(16.0).color(theme::fg(ui, colour)));
                         ui.vertical(|ui| {
@@ -183,14 +228,12 @@ impl Session {
                                 .join(" · ");
                             ui.add(egui::Label::new(RichText::new(meta).small().color(theme::muted(ui))).truncate());
                         });
-                    })
-                    .response
-                    .interact(egui::Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    });
+                });
                 if resp.clicked() {
                     self.open_paper(r.id);
                 }
-                ui.add_space(2.0);
+                ui.add_space(4.0);
             }
         });
     }

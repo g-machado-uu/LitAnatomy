@@ -1,7 +1,5 @@
 //! DOIs: finding them in messy text, and looking up their metadata.
 
-use std::time::Duration;
-
 use anyhow::{Context, Result, anyhow};
 
 use super::csljson;
@@ -69,18 +67,7 @@ pub fn url(doi: &str) -> String {
 
 /// Looks up a DOI: CSL-JSON by content negotiation at doi.org (Crossref,
 /// DataCite, mEDRA…), then the Crossref API if that fails.
-pub fn fetch(doi: &str, contact_email: &str) -> Result<NewPaper> {
-    let mut ua = format!("LitAnatomy/{} (https://github.com/g-machado-uu/LitAnatomy", env!("CARGO_PKG_VERSION"));
-    if !contact_email.trim().is_empty() {
-        // Crossref's "polite pool"; only sent if the user typed an address in Settings.
-        ua.push_str(&format!("; mailto:{}", contact_email.trim()));
-    }
-    ua.push(')');
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(20)))
-        .user_agent(ua.as_str())
-        .build()
-        .into();
+pub fn fetch(agent: &ureq::Agent, doi: &str) -> Result<NewPaper> {
     let negotiated = (|| -> Result<NewPaper> {
         let body = agent
             .get(&url(doi))
@@ -154,7 +141,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_lookup() {
-        let p = fetch("10.1038/s41467-023-40717-9", "").expect("lookup");
+        let p = fetch(&crate::import::http_agent(""), "10.1038/s41467-023-40717-9").expect("lookup");
         assert!(p.bib.title.to_lowercase().contains("metasurface"), "{}", p.bib.title);
         assert_eq!(p.bib.year, Some(2023));
         assert!(!p.bib.authors.is_empty());

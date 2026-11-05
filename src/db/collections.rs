@@ -9,7 +9,7 @@ use crate::model::{Collection, Paper, now_string};
 impl Library {
     pub fn collections(&self) -> Result<Vec<Collection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, colour, parent_id, archived, bib_export_path, position
+            "SELECT id, name, description, colour, parent_id, archived, bib_export_path, position, screening
              FROM collections ORDER BY position, name COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -22,6 +22,7 @@ impl Library {
                 archived: r.get(5)?,
                 bib_export_path: r.get(6)?,
                 position: r.get(7)?,
+                screening: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -47,7 +48,7 @@ impl Library {
         let parent = c.parent.filter(|p| *p != c.id && !self.descendants(c.id).unwrap_or_default().contains(p));
         self.conn.execute(
             "UPDATE collections SET name = ?2, description = ?3, colour = ?4, parent_id = ?5, archived = ?6,
-                bib_export_path = ?7, position = ?8 WHERE id = ?1",
+                bib_export_path = ?7, position = ?8, screening = ?9 WHERE id = ?1",
             params![
                 c.id,
                 c.name.trim(),
@@ -56,7 +57,8 @@ impl Library {
                 parent,
                 c.archived,
                 c.bib_export_path.as_deref().filter(|p| !p.trim().is_empty()),
-                c.position
+                c.position,
+                c.screening
             ],
         )?;
         self.touch();

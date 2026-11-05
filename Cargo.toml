@@ -1,6 +1,6 @@
 [package]
 name = "litanatomy"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 # Required by egui 0.37.
 rust-version = "1.95"
@@ -17,12 +17,18 @@ egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
 egui_extras = "0.37"
 open = "5.4"
+# PDF text and properties, for importing papers from their PDFs.
+pdf-extract = "0.12"
 rfd = "0.17.2"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.1"
 ureq = "3.5"
+
+# Picking X11 (XWayland) on Wayland desktops, where winit can't receive dropped files.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11"] }
 
 [build-dependencies]
 winresource = "0.1"

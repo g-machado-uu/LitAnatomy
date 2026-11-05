@@ -2,6 +2,7 @@
 
 pub mod bibtex;
 pub mod matrix;
+pub mod outline;
 
 use std::path::Path;
 

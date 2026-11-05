@@ -8,4 +8,5 @@ pub mod matrix;
 pub mod paper;
 pub mod settings;
 pub mod sidebar;
+pub mod synthesis;
 pub mod theme;

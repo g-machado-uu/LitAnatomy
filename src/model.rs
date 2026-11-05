@@ -201,6 +201,126 @@ pub struct Collection {
     /// Where auto-export writes this collection's .bib (if turned on in Settings).
     pub bib_export_path: Option<String>,
     pub position: i64,
+    /// A systematic review: its papers are screened (included or excluded)
+    /// against the collection's criteria.
+    pub screening: bool,
+}
+
+/// A screening decision for one paper in one systematic-review collection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Decision {
+    #[default]
+    Undecided,
+    Include,
+    Maybe,
+    Exclude,
+}
+
+impl Decision {
+    pub const ALL: [Decision; 4] = [Self::Undecided, Self::Include, Self::Maybe, Self::Exclude];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Undecided => "Not screened",
+            Self::Include => "Included",
+            Self::Maybe => "Maybe",
+            Self::Exclude => "Excluded",
+        }
+    }
+
+    /// As a button: "Include", "Maybe", "Exclude".
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Undecided => "Not screened",
+            Self::Include => "Include",
+            Self::Maybe => "Maybe",
+            Self::Exclude => "Exclude",
+        }
+    }
+
+    pub fn to_i64(self) -> i64 {
+        match self {
+            Self::Undecided => 0,
+            Self::Include => 1,
+            Self::Maybe => 2,
+            Self::Exclude => 3,
+        }
+    }
+
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => Self::Include,
+            2 => Self::Maybe,
+            3 => Self::Exclude,
+            _ => Self::Undecided,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CriterionKind {
+    Include,
+    Exclude,
+}
+
+impl CriterionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Include => "include",
+            Self::Exclude => "exclude",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        if s == "include" { Self::Include } else { Self::Exclude }
+    }
+
+    /// "IC" or "EC", for short labels such as "EC2".
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Include => "IC",
+            Self::Exclude => "EC",
+        }
+    }
+}
+
+/// An inclusion or exclusion criterion of a systematic review.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Criterion {
+    pub id: i64,
+    pub collection: i64,
+    pub kind: CriterionKind,
+    pub label: String,
+    pub position: i64,
+}
+
+/// "IC1", "EC3": the criterion's number among those of its kind, from 1.
+pub fn criterion_code(all: &[Criterion], id: i64) -> Option<String> {
+    let c = all.iter().find(|c| c.id == id)?;
+    let n = all.iter().filter(|o| o.kind == c.kind).position(|o| o.id == id)? + 1;
+    Some(format!("{}{n}", c.kind.prefix()))
+}
+
+/// Where a paper stands in a systematic review.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Screening {
+    pub decision: Decision,
+    /// The criteria that decided it (ids), usually the exclusion criteria it fails.
+    pub criteria: Vec<i64>,
+    pub note: String,
+    pub decided_at: Option<String>,
+}
+
+/// A theme of a collection's synthesis: an idea several papers share.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Theme {
+    pub id: i64,
+    pub collection: i64,
+    pub name: String,
+    pub notes: String,
+    pub position: i64,
+    /// (paper, how it fits the theme)
+    pub papers: Vec<(i64, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -1,13 +1,13 @@
 //! A list of papers: all, unfiled, the Trash or one collection.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use egui::{RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{PaperDrag, Session, View};
-use crate::db::Scope;
-use crate::model::{PaperRow, ReadingStatus};
+use crate::db::{Scope, ScreeningSummary};
+use crate::model::{Criterion, Decision, PaperRow, ReadingStatus, Screening, criterion_code};
 use crate::ui::dialogs::{CollectionForm, Dialog};
 use crate::ui::sidebar::plural;
 use crate::ui::{icons, theme};
@@ -60,11 +60,66 @@ pub struct ListState {
     pub ascending: bool,
     pub selected: BTreeSet<i64>,
     pub focus_search: bool,
+    /// Screening filter, in collections that screen.
+    pub decision: Option<Decision>,
     rows: Option<(u64, Scope, Vec<PaperRow>)>,
     hits: Option<(u64, String, HashSet<i64>)>,
+    review: Option<(u64, i64, Review)>,
+}
+
+/// A review collection's screening, cached per library revision.
+#[derive(Clone, Default)]
+pub struct Review {
+    pub screenings: HashMap<i64, Screening>,
+    pub criteria: Vec<Criterion>,
+    pub summary: ScreeningSummary,
+}
+
+impl Review {
+    /// "Excluded · EC1, EC3" style codes of a paper's ticked criteria.
+    fn codes(&self, s: &Screening) -> String {
+        s.criteria.iter().filter_map(|c| criterion_code(&self.criteria, *c)).collect::<Vec<_>>().join(", ")
+    }
+
+    /// The counts for a PRISMA flow diagram, as plain text.
+    pub fn prisma_text(&self, name: &str) -> String {
+        let s = &self.summary;
+        let mut out = format!("Screening of {name}\n");
+        out.push_str(&format!("Records screened: {}\n", s.total() - s.count(Decision::Undecided)));
+        out.push_str(&format!("Not screened yet: {}\n", s.count(Decision::Undecided)));
+        out.push_str(&format!("Included: {}\n", s.count(Decision::Include)));
+        out.push_str(&format!("Undecided (maybe): {}\n", s.count(Decision::Maybe)));
+        out.push_str(&format!("Excluded: {}\n", s.count(Decision::Exclude)));
+        for (cid, n) in &s.excluded_by {
+            let label = self.criteria.iter().find(|c| c.id == *cid).map(|c| c.label.as_str()).unwrap_or_default();
+            let code = criterion_code(&self.criteria, *cid).unwrap_or_default();
+            out.push_str(&format!("  {code} {label}: {n}\n"));
+        }
+        if s.excluded_without_reason > 0 {
+            out.push_str(&format!("  No criterion given: {}\n", s.excluded_without_reason));
+        }
+        out
+    }
 }
 
 impl Session {
+    /// The screening of a review collection (None if the collection doesn't screen).
+    pub(crate) fn review(&mut self, collection: i64) -> Option<Review> {
+        if !self.collection(collection).is_some_and(|c| c.screening) {
+            return None;
+        }
+        let rev = self.lib.revision();
+        if !matches!(&self.list.review, Some((r, c, _)) if *r == rev && *c == collection) {
+            let review = Review {
+                screenings: self.lib.screenings(collection).unwrap_or_default(),
+                criteria: self.lib.criteria(collection).unwrap_or_default(),
+                summary: self.lib.screening_summary(collection).unwrap_or_default(),
+            };
+            self.list.review = Some((rev, collection, review));
+        }
+        self.list.review.as_ref().map(|(_, _, r)| r.clone())
+    }
+
     /// The rows of `scope` after search, filters and sorting.
     pub(crate) fn visible_rows(&mut self, scope: Scope) -> Vec<PaperRow> {
         let rev = self.lib.revision();
@@ -79,6 +134,10 @@ impl Session {
             self.list.hits = Some((rev, query.clone(), hits));
         }
         let tagged = self.list.tag.map(|t| self.papers_with_tag(t));
+        let review = match (scope, self.list.decision) {
+            (Scope::Collection(c), Some(_)) => self.review(c),
+            _ => None,
+        };
         let l = &self.list;
         let mut rows: Vec<PaperRow> = l.rows.as_ref().map(|(_, _, r)| r.clone()).unwrap_or_default();
         rows.retain(|r| {
@@ -86,6 +145,10 @@ impl Session {
                 && l.status.is_none_or(|s| r.status == s)
                 && tagged.as_ref().is_none_or(|t| t.contains(&r.id))
                 && l.attention.is_none_or(|a| a.keeps(r))
+                && match (&review, l.decision) {
+                    (Some(rv), Some(d)) => rv.screenings.get(&r.id).map(|s| s.decision).unwrap_or_default() == d,
+                    _ => true,
+                }
         });
         let key = |r: &PaperRow| r.title.to_lowercase();
         match l.sort {
@@ -139,16 +202,84 @@ impl Session {
             if ui.button(format!("{} Matrix", icons::TABLE)).on_hover_text("Compare these papers side by side").clicked() {
                 self.go(View::Matrix(scope));
             }
+            if let Scope::Collection(id) = scope
+                && ui
+                    .button(format!("{} Synthesis", icons::TREE_STRUCTURE))
+                    .on_hover_text("Themes across these papers, and a draft related-work outline")
+                    .clicked()
+            {
+                self.go(View::Synthesis(id));
+            }
         });
+        let review = match scope {
+            Scope::Collection(id) => self.review(id),
+            _ => None,
+        };
         self.toolbar(ui);
+        if let (Some(review), Scope::Collection(id)) = (&review, scope) {
+            self.screening_bar(ui, id, review);
+        }
         if !self.list.selected.is_empty() {
-            self.selection_bar(ui, scope, &rows);
+            self.selection_bar(ui, scope, &rows, review.is_some());
         }
         if rows.is_empty() {
             self.empty_list(ui, scope, total);
             return;
         }
-        self.paper_table(ui, &rows, scope);
+        self.paper_table(ui, &rows, scope, review.as_ref());
+    }
+
+    /// A review's progress: papers per decision (click to filter), and why papers were excluded.
+    fn screening_bar(&mut self, ui: &mut Ui, collection: i64, review: &Review) {
+        let s = &review.summary;
+        egui::Frame::new()
+            .fill(theme::t(ui).raised)
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(theme::semibold(format!("{} Screening", icons::FUNNEL)));
+                    theme::progress(ui, if s.total() == 0 { 0.0 } else { 1.0 - s.count(Decision::Undecided) as f32 / s.total() as f32 }, 80.0, theme::accent(ui));
+                    for d in Decision::ALL {
+                        let (icon, colour) = theme::decision_style(d);
+                        let active = self.list.decision == Some(d);
+                        let text = format!("{icon} {} {}", d.label(), s.count(d));
+                        let resp = theme::chip_button(ui, text, if active { theme::accent(ui) } else { colour });
+                        if resp.on_hover_text(if active { "Show all papers" } else { "Show only these" }).clicked() {
+                            self.list.decision = if active { None } else { Some(d) };
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(theme::ghost_button(format!("{} PRISMA counts", icons::COPY)))
+                            .on_hover_text("Copy the numbers for a PRISMA flow diagram")
+                            .clicked()
+                        {
+                            let name = self.scope_title(Scope::Collection(collection));
+                            ui.ctx().copy_text(review.prisma_text(&name));
+                            self.info("Screening counts copied.");
+                        }
+                    });
+                });
+                let reasons: Vec<String> = s
+                    .excluded_by
+                    .iter()
+                    .filter(|(_, n)| *n > 0)
+                    .filter_map(|(c, n)| {
+                        let crit = review.criteria.iter().find(|x| x.id == *c)?;
+                        Some(format!("{} {} ({n})", criterion_code(&review.criteria, *c)?, crit.label))
+                    })
+                    .chain((s.excluded_without_reason > 0).then(|| format!("no criterion ({})", s.excluded_without_reason)))
+                    .collect();
+                if !reasons.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(format!("Excluded for: {}", reasons.join(" · "))).small().color(theme::muted(ui))).wrap());
+                }
+                if review.criteria.is_empty() {
+                    theme::hint(ui, "No criteria yet: add inclusion and exclusion criteria in the collection's settings (the gear button).");
+                }
+            });
+        ui.add_space(6.0);
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
@@ -187,18 +318,23 @@ impl Session {
             {
                 self.list.attention = None;
             }
-            let filtered = !self.list.search.is_empty() || self.list.status.is_some() || self.list.tag.is_some() || self.list.attention.is_some();
+            let filtered = !self.list.search.is_empty()
+                || self.list.status.is_some()
+                || self.list.tag.is_some()
+                || self.list.attention.is_some()
+                || self.list.decision.is_some();
             if filtered && ui.add(theme::ghost_button(format!("{} Clear filters", icons::X))).clicked() {
                 self.list.search.clear();
                 self.list.status = None;
                 self.list.tag = None;
                 self.list.attention = None;
+                self.list.decision = None;
             }
         });
         ui.add_space(6.0);
     }
 
-    fn selection_bar(&mut self, ui: &mut Ui, scope: Scope, rows: &[PaperRow]) {
+    fn selection_bar(&mut self, ui: &mut Ui, scope: Scope, rows: &[PaperRow], screening: bool) {
         let ids: Vec<i64> = self.list.selected.iter().copied().collect();
         egui::Frame::new()
             .fill(theme::t(ui).soft)
@@ -253,6 +389,20 @@ impl Session {
                                 }
                             }
                         });
+                        if let (Scope::Collection(id), true) = (scope, screening) {
+                            let resp = ui.button(format!("{} Set decision {}", icons::FUNNEL, icons::CARET_DOWN));
+                            egui::Popup::menu(&resp).id(egui::Id::unique("set-decision")).show(|ui| {
+                                for d in Decision::ALL {
+                                    let (icon, colour) = theme::decision_style(d);
+                                    if ui.button(RichText::new(format!("{icon}  {}", d.verb())).color(theme::fg(ui, colour))).clicked() {
+                                        let r = self.lib.set_decision(id, &ids, d);
+                                        if self.check(r).is_some() {
+                                            self.info(format!("{}: {}.", d.label(), plural(ids.len(), "paper")));
+                                        }
+                                    }
+                                }
+                            });
+                        }
                         if ui.button(format!("{} Export .bib", icons::EXPORT)).clicked() {
                             let name = format!("{}-selection", self.scope_title(scope));
                             self.export_bib(&ids, &name);
@@ -300,16 +450,19 @@ impl Session {
                     ui.label(RichText::new(icons::BOOKS).size(40.0).color(theme::muted(ui)));
                     ui.label(theme::semibold("No papers here yet"));
                     let hint = if matches!(scope, Scope::Collection(_)) {
-                        "Add papers by DOI or from a file, or drag papers here from All papers."
+                        "Add papers by DOI, from their PDFs or from a file, or drag papers here from All papers."
                     } else {
-                        "Add papers by DOI or import a BibTeX, RIS, RefWorks or CSL-JSON file."
+                        "Add papers by DOI, from their PDFs, or import a BibTeX, RIS, RefWorks or CSL-JSON file."
                     };
                     ui.label(RichText::new(hint).color(theme::muted(ui)));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
+                        ui.add_space((ui.available_width() - 470.0).max(0.0) / 2.0);
                         if ui.add(theme::primary_button(ui, format!("{} Add by DOI", icons::MAGIC_WAND))).clicked() {
                             self.dialog = Some(Dialog::AddDoi { text: String::new(), target: self.current_collection() });
+                        }
+                        if ui.button(format!("{} From PDFs…", icons::FILE_PDF)).clicked() {
+                            self.pick_pdfs(ui.ctx());
                         }
                         if ui.button(format!("{} Import a file…", icons::DOWNLOAD_SIMPLE)).clicked() {
                             self.pick_import_file();
@@ -320,23 +473,25 @@ impl Session {
         });
     }
 
-    fn paper_table(&mut self, ui: &mut Ui, rows: &[PaperRow], scope: Scope) {
+    fn paper_table(&mut self, ui: &mut Ui, rows: &[PaperRow], scope: Scope, review: Option<&Review>) {
         let mut open = None;
         let mut toggle = None;
         let all_selected = rows.iter().all(|r| self.list.selected.contains(&r.id));
         let mut select_all = None;
         let mut sort_clicked = None;
-        let headers = [
+        let mut headers = vec![
             (None, ""),
             (None, ""),
             (Some(SortKey::Title), "Paper"),
             (Some(SortKey::Year), "Year"),
             (Some(SortKey::Status), "Status"),
-            (Some(SortKey::Progress), "Dissected"),
-            (None, "PDF"),
         ];
+        if review.is_some() {
+            headers.push((None, "Screening"));
+        }
+        headers.extend([(Some(SortKey::Progress), "Dissected"), (None, "PDF")]);
         let (sort, ascending) = (self.list.sort, self.list.ascending);
-        TableBuilder::new(ui)
+        let mut table = TableBuilder::new(ui)
             .striped(false)
             .sense(Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -344,7 +499,11 @@ impl Session {
             .column(Column::exact(18.0))
             .column(Column::remainder().at_least(260.0).clip(true))
             .column(Column::exact(56.0))
-            .column(Column::exact(124.0))
+            .column(Column::exact(124.0));
+        if review.is_some() {
+            table = table.column(Column::exact(150.0).clip(true));
+        }
+        table
             .column(Column::exact(112.0))
             .column(Column::exact(40.0))
             .header(30.0, |mut header| {
@@ -422,6 +581,22 @@ impl Session {
                     row.col(|ui| {
                         theme::status_chip(ui, r.status);
                     });
+                    if let Some(review) = review {
+                        row.col(|ui| {
+                            let s = review.screenings.get(&r.id).cloned().unwrap_or_default();
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                let resp = theme::decision_chip(ui, s.decision);
+                                let codes = review.codes(&s);
+                                if !codes.is_empty() {
+                                    ui.label(RichText::new(codes).small().color(theme::muted(ui)));
+                                }
+                                if !s.note.is_empty() {
+                                    resp.on_hover_text(&s.note);
+                                }
+                            });
+                        });
+                    }
                     row.col(|ui| {
                         let f = if r.field_total == 0 { 0.0 } else { r.filled as f32 / r.field_total as f32 };
                         theme::progress(ui, f, 64.0, theme::accent(ui));

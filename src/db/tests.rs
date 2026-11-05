@@ -1,6 +1,6 @@
 use super::*;
 use crate::citekey::DEFAULT_PATTERN;
-use crate::model::{Author, Biblio, FieldKind, NewPaper, ReadingStatus, Relation};
+use crate::model::{Author, Biblio, CriterionKind, Decision, FieldKind, NewPaper, ReadingStatus, Relation, Screening};
 
 fn new_paper(family: &str, year: i32, title: &str, doi: Option<&str>) -> NewPaper {
     NewPaper {
@@ -224,4 +224,128 @@ fn backup_copy() {
     let copy = dir.path().join("b.litanatomy");
     lib.backup_to(&copy).unwrap();
     assert_eq!(Library::open(&copy).unwrap().rows(Scope::All).unwrap().len(), 1);
+}
+
+/// A library saved by v0.1 (format 1) opens in v0.2 and keeps its papers.
+#[test]
+fn upgrades_a_version_1_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.litanatomy");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO papers (citekey, title, added_at, modified_at) VALUES ('old2020Paper', 'Old Paper', 'x', 'x');
+             INSERT INTO collections (name, created_at) VALUES ('Review', 'x');
+             INSERT INTO collection_papers (collection_id, paper_id, added_at, relevance) VALUES (1, 1, 'x', 'Why');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let mut lib = Library::open(&path).unwrap();
+    let version: i64 = lib.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(lib.rows(Scope::Collection(1)).unwrap().len(), 1);
+    assert_eq!(lib.relevance(1, 1).unwrap().as_deref(), Some("Why"));
+    let c = lib.collection(1).unwrap().unwrap();
+    assert!(!c.screening);
+    assert_eq!(lib.screening(1, 1).unwrap(), Some(Screening::default()));
+    assert_eq!(lib.synthesis(1).unwrap(), (String::new(), String::new()));
+    // And it is usable: the new tables exist.
+    lib.add_theme(1, "Theme").unwrap();
+    lib.add_criterion(1, CriterionKind::Exclude, "Not in English").unwrap();
+    drop(lib);
+    // Opening again is a no-op.
+    assert!(Library::open(&path).is_ok());
+}
+
+#[test]
+fn screening_decisions_and_counts() {
+    let mut lib = Library::open_in_memory().unwrap();
+    let review = lib.create_collection("Review", None, 0).unwrap();
+    let mut c = lib.collection(review).unwrap().unwrap();
+    c.screening = true;
+    lib.update_collection(&c).unwrap();
+    assert!(lib.collection(review).unwrap().unwrap().screening);
+
+    let ic = lib.add_criterion(review, CriterionKind::Include, "Peer reviewed").unwrap();
+    let ec1 = lib.add_criterion(review, CriterionKind::Exclude, "Not in English").unwrap();
+    let ec2 = lib.add_criterion(review, CriterionKind::Exclude, "No measurements").unwrap();
+    assert!(lib.add_criterion(review, CriterionKind::Exclude, "  ").is_err());
+    let criteria = lib.criteria(review).unwrap();
+    assert_eq!(criteria.iter().map(|c| c.id).collect::<Vec<_>>(), vec![ic, ec1, ec2], "inclusion first");
+    assert_eq!(crate::model::criterion_code(&criteria, ec2).as_deref(), Some("EC2"));
+
+    let ids: Vec<i64> = (0..4)
+        .map(|i| lib.add_paper(&new_paper("Zhang", 2020 + i, &format!("Paper number {i} on surfaces"), None), DEFAULT_PATTERN).unwrap())
+        .collect();
+    lib.add_to_collection(review, &ids).unwrap();
+    lib.set_screening(review, ids[0], &Screening { decision: Decision::Include, criteria: vec![ic], ..Default::default() }).unwrap();
+    lib.set_screening(
+        review,
+        ids[1],
+        &Screening { decision: Decision::Exclude, criteria: vec![ec1, ec2], note: "German".into(), ..Default::default() },
+    )
+    .unwrap();
+    lib.set_decision(review, &[ids[2]], Decision::Exclude).unwrap();
+    let s = lib.screening(review, ids[1]).unwrap().unwrap();
+    assert_eq!((s.decision, s.note.as_str()), (Decision::Exclude, "German"));
+    assert!(s.decided_at.is_some());
+    // Not a member: no screening, and setting one fails.
+    let outside = lib.add_paper(&new_paper("Li", 2021, "Elsewhere entirely", None), DEFAULT_PATTERN).unwrap();
+    assert_eq!(lib.screening(review, outside).unwrap(), None);
+    assert!(lib.set_screening(review, outside, &Screening::default()).is_err());
+
+    let sum = lib.screening_summary(review).unwrap();
+    assert_eq!(
+        (sum.count(Decision::Include), sum.count(Decision::Exclude), sum.count(Decision::Undecided), sum.total()),
+        (1, 2, 1, 4)
+    );
+    assert_eq!(sum.excluded_by, vec![(ec1, 1), (ec2, 1)]);
+    assert_eq!(sum.excluded_without_reason, 1);
+
+    // Deleting a criterion un-ticks it; trashed papers drop out of the counts.
+    lib.delete_criterion(ec1).unwrap();
+    assert_eq!(lib.screening(review, ids[1]).unwrap().unwrap().criteria, vec![ec2]);
+    lib.trash(&[ids[0]]).unwrap();
+    assert_eq!(lib.screening_summary(review).unwrap().count(Decision::Include), 0);
+    // Back to "not screened" clears the date.
+    lib.set_decision(review, &[ids[1]], Decision::Undecided).unwrap();
+    assert_eq!(lib.screening(review, ids[1]).unwrap().unwrap().decided_at, None);
+}
+
+#[test]
+fn synthesis_themes_and_outline() {
+    let mut lib = Library::open_in_memory().unwrap();
+    let c = lib.create_collection("Chapter 2", None, 0).unwrap();
+    let a = lib.add_paper(&new_paper("Zhang", 2025, "Wideband Surfaces", None), DEFAULT_PATTERN).unwrap();
+    let b = lib.add_paper(&new_paper("Li", 2019, "Narrowband Surfaces", None), DEFAULT_PATTERN).unwrap();
+    lib.set_synthesis_notes(c, "Most use PIN diodes.").unwrap();
+    lib.set_outline(c, "# Related work").unwrap();
+    assert_eq!(lib.synthesis(c).unwrap(), ("Most use PIN diodes.".into(), "# Related work".into()));
+
+    let t1 = lib.add_theme(c, "Unit cells").unwrap();
+    let t2 = lib.add_theme(c, "Measurements").unwrap();
+    assert!(lib.add_theme(c, " ").is_err());
+    assert_eq!(lib.add_to_theme(t1, &[a, b]).unwrap(), 2);
+    assert_eq!(lib.add_to_theme(t1, &[a]).unwrap(), 0, "already there");
+    lib.set_theme_note(t1, a, "Two diodes").unwrap();
+    lib.update_theme(t1, "Unit-cell design", "Cheaper cells").unwrap();
+    let themes = lib.themes(c).unwrap();
+    assert_eq!(themes[0].name, "Unit-cell design");
+    assert_eq!(themes[0].notes, "Cheaper cells");
+    // Papers by year: Li (2019) first.
+    assert_eq!(themes[0].papers, vec![(b, String::new()), (a, "Two diodes".to_string())]);
+    assert_eq!(lib.themes_of(a).unwrap(), vec![(c, "Unit-cell design".to_string())]);
+
+    lib.move_theme(t2, true).unwrap();
+    assert_eq!(lib.themes(c).unwrap().iter().map(|t| t.id).collect::<Vec<_>>(), vec![t2, t1]);
+    lib.trash(&[b]).unwrap();
+    assert_eq!(lib.themes(c).unwrap()[1].papers.len(), 1, "trashed papers are left out");
+    lib.remove_from_theme(t1, a).unwrap();
+    lib.delete_theme(t2).unwrap();
+    assert_eq!(lib.themes(c).unwrap().len(), 1);
+    // Deleting the collection deletes its themes.
+    lib.delete_collection(c).unwrap();
+    assert!(lib.themes_of(b).unwrap().is_empty());
 }

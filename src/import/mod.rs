@@ -3,12 +3,16 @@
 pub mod bibtex;
 pub mod csljson;
 pub mod doi;
+pub mod ident;
+pub mod lookup;
 pub mod names;
+pub mod pdf;
 pub mod refworks;
 pub mod ris;
 pub mod zotero;
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -86,6 +90,17 @@ pub fn read_file(path: &Path) -> Result<(Format, Parsed)> {
         format!("{name} doesn't look like a BibTeX, BibLaTeX, RIS, RefWorks or CSL-JSON file.")
     })?;
     Ok((format, parse(format, &text)))
+}
+
+/// The HTTP client for lookups, named so the services know who is asking.
+pub fn http_agent(contact_email: &str) -> ureq::Agent {
+    let mut ua = format!("LitAnatomy/{} (https://github.com/g-machado-uu/LitAnatomy", env!("CARGO_PKG_VERSION"));
+    if !contact_email.trim().is_empty() {
+        // Crossref's "polite pool"; only sent if the user typed an address in Settings.
+        ua.push_str(&format!("; mailto:{}", contact_email.trim()));
+    }
+    ua.push(')');
+    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).user_agent(ua.as_str()).build().into()
 }
 
 /// "12--19", "12–19", "12 - 19" → "12-19".

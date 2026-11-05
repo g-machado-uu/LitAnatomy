@@ -8,7 +8,9 @@ use egui::{RichText, Ui};
 use crate::app::{Session, View};
 use crate::citekey;
 use crate::db::{Library, Scope};
-use crate::model::{Collection, Field, FieldKind, NewPaper, authors_short};
+use crate::import::ident::Identifier;
+use crate::model::{Collection, Criterion, CriterionKind, Field, FieldKind, NewPaper, authors_short};
+use crate::net::Found;
 use crate::pdf;
 use crate::ui::sidebar::plural;
 use crate::ui::{icons, theme};
@@ -22,6 +24,10 @@ pub enum Dialog {
     ConfirmEmptyTrash,
     ConfirmPurge(Vec<i64>),
     EditCell { paper: i64, field: i64, label: String, title: String, text: String },
+    /// Ctrl+Shift+Delete on an open paper.
+    ConfirmTrash(i64),
+    /// The list of keyboard shortcuts (F1).
+    Shortcuts,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,11 +45,17 @@ pub struct Candidate {
     pub key: String,
     pub duplicate: Option<(i64, String)>,
     pub choice: Choice,
+    /// How it was found (papers from PDFs), and whether to check it.
+    pub note: Option<(String, bool)>,
 }
 
 impl Candidate {
     pub fn new(paper: NewPaper) -> Self {
-        Self { paper, key: String::new(), duplicate: None, choice: Choice::Add }
+        Self { paper, key: String::new(), duplicate: None, choice: Choice::Add, note: None }
+    }
+
+    pub fn found(f: Found) -> Self {
+        Self { note: f.note.map(|n| (n, f.sure)), ..Self::new(f.paper) }
     }
 }
 
@@ -59,12 +71,25 @@ pub struct ImportState {
     pub keep_keys: bool,
     /// A line under the summary, e.g. what was left out.
     pub note: Option<String>,
+    /// The pending jobs are PDFs being read, not identifiers.
+    pub reading_pdfs: bool,
     checked: usize,
 }
 
 impl ImportState {
     pub fn new(source: String, base_dir: Option<PathBuf>, target: Option<i64>, keep_keys: bool) -> Self {
-        Self { source, base_dir, candidates: Vec::new(), errors: Vec::new(), target, pending: None, keep_keys, note: None, checked: 0 }
+        Self {
+            source,
+            base_dir,
+            candidates: Vec::new(),
+            errors: Vec::new(),
+            target,
+            pending: None,
+            keep_keys,
+            note: None,
+            reading_pdfs: false,
+            checked: 0,
+        }
     }
 
     /// Works out keys (unique against the library and each other) and
@@ -108,13 +133,24 @@ pub struct CollectionForm {
     pub fields: Vec<Field>,
     pub new_field: String,
     pub new_kind: FieldKind,
+    pub criteria: Vec<Criterion>,
+    pub new_include: String,
+    pub new_exclude: String,
 }
 
 impl CollectionForm {
     pub fn load(lib: &Library, id: i64) -> Option<Self> {
         let collection = lib.collection(id).ok().flatten()?;
         let fields = lib.fields(Some(id)).ok()?.into_iter().filter(|f| f.collection == Some(id)).collect();
-        Some(Self { collection, fields, new_field: String::new(), new_kind: FieldKind::ShortText })
+        Some(Self {
+            collection,
+            fields,
+            new_field: String::new(),
+            new_kind: FieldKind::ShortText,
+            criteria: lib.criteria(id).ok()?,
+            new_include: String::new(),
+            new_exclude: String::new(),
+        })
     }
 }
 
@@ -131,7 +167,12 @@ impl Session {
                 self.confirm(ui, "Delete collection", &format!("Delete \"{name}\" and its sub-collections? The papers stay in your library, with their notes."), "Delete collection", |s| {
                     let r = s.lib.delete_collection(id);
                     s.check(r);
-                    if s.view == View::List(Scope::Collection(id)) {
+                    let showing = match &s.view {
+                        View::List(Scope::Collection(c)) | View::Matrix(Scope::Collection(c)) | View::Synthesis(c) => *c == id,
+                        _ => false,
+                    };
+                    if showing {
+                        s.synthesis = None;
                         s.go(View::Home);
                     }
                 })
@@ -155,6 +196,14 @@ impl Session {
                 })
             }
             Dialog::EditCell { paper, field, label, title, text } => self.edit_cell_dialog(ui, *paper, *field, label, title, text),
+            Dialog::ConfirmTrash(id) => {
+                let id = *id;
+                let title = self.page.as_ref().filter(|p| p.id == id).map(|p| p.paper.bib.title.clone()).unwrap_or_default();
+                self.confirm(ui, "Move to the Trash", &format!("Move \"{title}\" to the Trash? It can be restored from there."), "Move to Trash", |s| {
+                    s.trash_open_paper(id);
+                })
+            }
+            Dialog::Shortcuts => self.shortcuts_dialog(ui),
         };
         if keep && self.dialog.is_none() {
             self.dialog = Some(dialog);
@@ -196,30 +245,53 @@ impl Session {
         let mut open = true;
         let mut go = false;
         let resp = egui::Modal::new(egui::Id::unique("add-doi")).frame(theme::modal_frame(ui)).show(ui.ctx(), |ui| {
-            ui.set_width(520.0);
-            ui.label(theme::serif("Add by DOI", 24.0));
+            ui.set_width(540.0);
+            ui.label(theme::serif("Add by identifier", 24.0));
             ui.add_space(4.0);
-            theme::hint(ui, "Paste one or more DOIs or doi.org links, in any form: \"DOI: 10.1109/…\", \"https://doi.org/…\", one per line or mixed with other text.");
+            theme::hint(
+                ui,
+                "Paste DOIs, arXiv IDs, ISBNs or PubMed IDs, one per line or mixed with other text: \
+                 \"10.1109/…\", \"https://doi.org/…\", \"arXiv:2301.12345\", \"ISBN 978-…\", \"PMID: 31452104\".",
+            );
             ui.add_space(6.0);
             let edit = ui.add(
                 egui::TextEdit::multiline(text)
-                    .hint_text("10.1109/TAP.2025.3603900")
+                    .hint_text("10.1109/TAP.2025.3603900\narXiv:1706.03762")
                     .desired_rows(4)
                     .desired_width(f32::INFINITY),
             );
             edit.request_focus();
-            let n = crate::import::doi::find_all(text).len();
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
+                go = true;
+            }
+            let ids = crate::import::ident::find_all(text);
+            if !ids.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for id in ids.iter().take(12) {
+                        let colour = match id {
+                            Identifier::Doi(_) => theme::accent(ui),
+                            Identifier::Arxiv(_) => theme::RED,
+                            Identifier::Isbn(_) => theme::AMBER,
+                            Identifier::Pmid(_) => theme::GREEN,
+                        };
+                        theme::chip(ui, id.display(), colour);
+                    }
+                    if ids.len() > 12 {
+                        ui.label(RichText::new(format!("and {} more", ids.len() - 12)).small().color(theme::muted(ui)));
+                    }
+                });
+            }
             if let Some(c) = target.and_then(|c| self.collection(c)) {
                 theme::hint(ui, format!("New papers go into the collection \"{}\".", c.name));
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let label = match n {
+                let label = match ids.len() {
                     0 => "Look up".to_string(),
-                    1 => "Look up 1 DOI".to_string(),
-                    n => format!("Look up {n} DOIs"),
+                    1 => format!("Look up the {}", ids[0].kind()),
+                    n => format!("Look up {n} papers"),
                 };
-                if ui.add_enabled(n > 0, theme::primary_button(ui, format!("{} {label}", icons::MAGIC_WAND))).clicked() {
+                if ui.add_enabled(!ids.is_empty(), theme::primary_button(ui, format!("{} {label}", icons::MAGIC_WAND))).clicked() {
                     go = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -230,10 +302,9 @@ impl Session {
         if resp.should_close() {
             open = false;
         }
-        if go {
+        if go && !text.trim().is_empty() {
             let text = text.clone();
-            self.lookup_dois(ui.ctx(), &text, target);
-            return false;
+            return !self.lookup_ids(ui.ctx(), &text, target);
         }
         open
     }
@@ -260,7 +331,11 @@ impl Session {
             if let Some((_, left)) = state.pending {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("Looking up {} more…", plural(left, "DOI")));
+                    if state.reading_pdfs {
+                        ui.label(format!("Reading {} and looking them up…", plural(left, "more PDF")));
+                    } else {
+                        ui.label(format!("Looking up {} more…", plural(left, "identifier")));
+                    }
                 });
             }
             ui.add_space(6.0);
@@ -277,10 +352,13 @@ impl Session {
                     ui.label(RichText::new("You can drag them onto a collection later.").small().color(theme::muted(ui)));
                 }
                 ui.add_space(12.0);
-                if ui
-                    .checkbox(&mut state.keep_keys, "Keep readable keys from the file")
-                    .on_hover_text("Numeric or database keys (like IEEE's 10234847) are always replaced.")
-                    .changed()
+                // Only files carry keys; PDFs and lookups don't.
+                let has_keys = state.candidates.iter().any(|c| c.paper.source_key.is_some());
+                if has_keys
+                    && ui
+                        .checkbox(&mut state.keep_keys, "Keep readable keys from the file")
+                        .on_hover_text("Numeric or database keys (like IEEE's 10234847) are always replaced.")
+                        .changed()
                 {
                     keys_changed = true;
                 }
@@ -302,6 +380,15 @@ impl Session {
                             .collect::<Vec<_>>()
                             .join(" · ");
                             ui.add(egui::Label::new(RichText::new(meta).small().color(theme::muted(ui))).wrap());
+                            if let Some(pdf) = &c.paper.pdf_path {
+                                let name = Path::new(pdf).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                ui.label(RichText::new(format!("{} {name}", icons::FILE_PDF)).small().color(theme::muted(ui)))
+                                    .on_hover_text(pdf.as_str());
+                            }
+                            if let Some((note, sure)) = &c.note {
+                                let (icon, colour) = if *sure { (icons::CHECK, theme::muted(ui)) } else { (icons::WARNING, theme::fg(ui, theme::AMBER)) };
+                                ui.add(egui::Label::new(RichText::new(format!("{icon} {note}")).small().color(colour)).wrap());
+                            }
                         });
                         ui.vertical(|ui| {
                             ui.set_width(210.0);
@@ -334,7 +421,7 @@ impl Session {
                 });
                 if !state.errors.is_empty() {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(format!("{} {} could not be read:", icons::WARNING, plural(state.errors.len(), "entry"))).color(theme::fg(ui, theme::AMBER)));
+                    ui.label(RichText::new(format!("{} Skipped {}:", icons::WARNING, plural(state.errors.len(), "entry"))).color(theme::fg(ui, theme::AMBER)));
                     for e in &state.errors {
                         ui.label(RichText::new(e).small().color(theme::muted(ui)));
                     }
@@ -598,6 +685,8 @@ impl Session {
                         }
                     }
                 });
+                ui.add_space(10.0);
+                self.criteria_editor(ui, form);
             });
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -628,6 +717,10 @@ impl Session {
                 let r = self.lib.update_field(f);
                 self.check(r);
             }
+            for c in form.criteria.iter().filter(|c| !c.label.trim().is_empty()) {
+                let r = self.lib.update_criterion(c.id, &c.label);
+                self.check(r);
+            }
             // Changing the export file should export straight away.
             self.auto.done_rev = 0;
             return false;
@@ -639,6 +732,69 @@ impl Session {
         open
     }
 
+    /// Turns screening on or off, and edits the inclusion and exclusion criteria.
+    fn criteria_editor(&mut self, ui: &mut Ui, form: &mut CollectionForm) {
+        let id = form.collection.id;
+        theme::card_title(ui, "Systematic review");
+        ui.checkbox(&mut form.collection.screening, "Screen these papers: include or exclude each one against criteria");
+        if !form.collection.screening {
+            theme::hint(ui, "For a systematic review. Each paper gets a Screening tab, and the list counts what was included and excluded, and why.");
+            return;
+        }
+        theme::hint(ui, "Excluded papers stay in the collection, so the counts for a PRISMA flow diagram add up.");
+        let mut remove = None;
+        let mut reload = false;
+        for kind in [CriterionKind::Include, CriterionKind::Exclude] {
+            ui.add_space(6.0);
+            let title = if kind == CriterionKind::Include { "Inclusion criteria" } else { "Exclusion criteria" };
+            ui.label(theme::semibold(title));
+            let mut n = 0;
+            for c in form.criteria.iter_mut().filter(|c| c.kind == kind) {
+                n += 1;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}{n}", kind.prefix())).monospace().color(theme::muted(ui)));
+                    ui.add(egui::TextEdit::singleline(&mut c.label).desired_width(400.0));
+                    if ui.add(theme::ghost_button(icons::TRASH)).on_hover_text("Delete the criterion (papers that cite it lose the tick)").clicked() {
+                        remove = Some(c.id);
+                    }
+                });
+            }
+            let (input, hint) = match kind {
+                CriterionKind::Include => (&mut form.new_include, "e.g. Peer-reviewed, published 2015 or later"),
+                CriterionKind::Exclude => (&mut form.new_exclude, "e.g. Not in English, or no measured results"),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}{}", kind.prefix(), n + 1)).monospace().color(theme::muted(ui)));
+                let edit = ui.add(egui::TextEdit::singleline(input).hint_text(hint).desired_width(400.0));
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.add_enabled(!input.trim().is_empty(), egui::Button::new(format!("{} Add", icons::PLUS))).clicked() || enter)
+                    && !input.trim().is_empty()
+                {
+                    let r = self.lib.add_criterion(id, kind, input);
+                    if self.check(r).is_some() {
+                        input.clear();
+                        reload = true;
+                    }
+                }
+            });
+        }
+        if let Some(cid) = remove {
+            let r = self.lib.delete_criterion(cid);
+            self.check(r);
+            reload = true;
+        }
+        if reload {
+            // Keep labels being edited, pick up added or deleted criteria.
+            let edited: Vec<(i64, String)> = form.criteria.iter().map(|c| (c.id, c.label.clone())).collect();
+            form.criteria = self.lib.criteria(id).unwrap_or_default();
+            for c in &mut form.criteria {
+                if let Some((_, label)) = edited.iter().find(|(e, _)| *e == c.id) {
+                    c.label = label.clone();
+                }
+            }
+        }
+    }
+
     fn edit_cell_dialog(&mut self, ui: &mut Ui, paper: i64, field: i64, label: &str, title: &str, text: &mut String) -> bool {
         let mut open = true;
         let mut save = false;
@@ -648,6 +804,9 @@ impl Session {
             ui.label(RichText::new(title).color(theme::muted(ui)));
             ui.add_space(8.0);
             ui.add(egui::TextEdit::multiline(text).desired_rows(10).desired_width(f32::INFINITY));
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
+                save = true;
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.add(theme::primary_button(ui, format!("{} Save", icons::CHECK))).clicked() {
@@ -667,6 +826,75 @@ impl Session {
             return false;
         }
         open
+    }
+}
+
+impl Session {
+    /// The keyboard shortcuts, from the keyboard button in the sidebar or F1.
+    fn shortcuts_dialog(&mut self, ui: &mut Ui) -> bool {
+        let ctx = ui.ctx().clone();
+        let key = |modifiers, key| ctx.format_shortcut(&egui::KeyboardShortcut::new(modifiers, key));
+        let cmd = egui::Modifiers::COMMAND;
+        let groups = [
+            (
+                "Anywhere",
+                vec![
+                    ("F1".to_string(), "Show this list"),
+                    (key(cmd, egui::Key::F), "Search all papers"),
+                    (key(cmd, egui::Key::V), "Add copied PDFs or files (with no field selected)"),
+                    ("Esc".to_string(), "Go back: paper › its list › Home"),
+                ],
+            ),
+            (
+                "Writing notes",
+                vec![
+                    ("Tab".to_string(), "Next field"),
+                    (key(egui::Modifiers::SHIFT, egui::Key::Tab), "Previous field"),
+                    (key(cmd, egui::Key::Enter), "Stop editing (notes show formatted)"),
+                    ("Esc".to_string(), "Leave the field"),
+                ],
+            ),
+            (
+                "A paper",
+                vec![
+                    (key(cmd | egui::Modifiers::SHIFT, egui::Key::Delete), "Move it to the Trash (asks first)"),
+                    ("Esc".to_string(), "Back to the list it was opened from"),
+                ],
+            ),
+            (
+                "Dialogs",
+                vec![
+                    (key(cmd, egui::Key::Enter), "Look up, or save the cell"),
+                    ("Esc".to_string(), "Close"),
+                ],
+            ),
+        ];
+        let mut close = false;
+        let resp = egui::Modal::new(egui::Id::unique("shortcuts")).frame(theme::modal_frame(ui)).show(&ctx, |ui| {
+            ui.set_width(460.0);
+            ui.horizontal(|ui| {
+                theme::icon_badge(ui, icons::KEYBOARD, theme::accent(ui), 40.0);
+                ui.label(theme::serif("Keyboard shortcuts", 22.0));
+            });
+            for (title, rows) in groups {
+                ui.add_space(10.0);
+                theme::card_title(ui, title);
+                egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([16.0, 6.0]).min_col_width(150.0).show(ui, |ui| {
+                    for (keys, what) in rows {
+                        ui.label(RichText::new(keys).monospace());
+                        ui.label(what);
+                        ui.end_row();
+                    }
+                });
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(theme::primary_button(ui, "Close")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        !(close || resp.should_close())
     }
 }
 

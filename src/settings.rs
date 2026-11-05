@@ -50,6 +50,9 @@ pub struct Settings {
     pub contact_email: String,
     /// Keep readable keys found in imported files (numeric ones are always replaced).
     pub keep_readable_keys: bool,
+    /// Linux: a native Wayland window instead of XWayland (sharper when
+    /// scaled, but files can't be dropped on it). Read at start-up.
+    pub native_wayland: bool,
 }
 
 impl Default for Settings {
@@ -66,6 +69,7 @@ impl Default for Settings {
             library_path: None,
             contact_email: String::new(),
             keep_readable_keys: false,
+            native_wayland: false,
         }
     }
 }

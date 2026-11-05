@@ -29,7 +29,8 @@ impl Session {
             ui.add_space(12.0);
             self.add_menu(ui);
             ui.add_space(10.0);
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let bottom_row = 40.0;
+            egui::ScrollArea::vertical().auto_shrink(false).max_height((ui.available_height() - bottom_row).max(80.0)).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 self.library_nav(ui);
                 ui.add_space(12.0);
@@ -38,7 +39,17 @@ impl Session {
                     ui.add_space(12.0);
                     self.tags_nav(ui);
                 }
-                ui.add_space(70.0);
+                ui.add_space(20.0);
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let keys = egui::Button::new(RichText::new(icons::KEYBOARD).size(17.0))
+                    .frame_when_inactive(false)
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .min_size(egui::vec2(36.0, 36.0));
+                if ui.add(keys).on_hover_text("Keyboard shortcuts (F1)").clicked() {
+                    self.dialog = Some(Dialog::Shortcuts);
+                }
             });
         });
     }
@@ -77,8 +88,19 @@ impl Session {
         let resp = ui.add(button);
         egui::Popup::menu(&resp).id(egui::Id::unique("add-menu")).show(|ui| {
             ui.set_min_width(220.0);
-            if ui.button(format!("{}  By DOI…", icons::MAGIC_WAND)).clicked() {
+            if ui
+                .button(format!("{}  By DOI, arXiv, ISBN…", icons::MAGIC_WAND))
+                .on_hover_text("DOIs, arXiv IDs, ISBNs or PubMed IDs")
+                .clicked()
+            {
                 self.dialog = Some(Dialog::AddDoi { text: String::new(), target: self.current_collection() });
+            }
+            if ui
+                .button(format!("{}  From PDFs…", icons::FILE_PDF))
+                .on_hover_text("Finds each paper's details from its PDF and keeps the PDF linked. You can also drop PDFs on the window.")
+                .clicked()
+            {
+                self.pick_pdfs(ui.ctx());
             }
             if ui.button(format!("{}  Import a file…", icons::DOWNLOAD_SIMPLE)).on_hover_text("BibTeX, BibLaTeX, RIS, RefWorks or CSL-JSON").clicked() {
                 self.pick_import_file();
@@ -131,6 +153,7 @@ impl Session {
         match &self.view {
             View::Paper(_) => self.back.iter().rev().find(|v| !matches!(v, View::Paper(_))).cloned().unwrap_or(View::Home),
             View::Matrix(scope) => View::List(*scope),
+            View::Synthesis(c) => View::List(Scope::Collection(*c)),
             v => v.clone(),
         }
     }
