@@ -627,3 +627,144 @@ fn pasted_file_lists() {
     assert!(file_paths(&format!("{}\nsome words", a.display())).is_empty(), "everything must be a file");
     assert!(file_paths(&format!("{}", dir.path().join("missing.pdf").display())).is_empty());
 }
+
+#[test]
+fn metrics_list_status_and_home_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(&dir.path().join("library.litanatomy"), Settings { theme_mode: ThemeMode::Light, ..Default::default() });
+    let s = session(&mut h);
+    let a = add(s, "Zhang", 2025, "A 2-bit wideband reconfigurable surface");
+    add(s, "Li", 2019, "Varactor-tuned reflectarrays");
+    add(s, "Wu", 2021, "Liquid-crystal phase shifters");
+    s.refresh_cache();
+    s.go(View::Home);
+    h.run_steps(3);
+
+    // The status cards on Home list their papers.
+    h.get_by_role_and_label(Role::Button, "To read").click();
+    h.run_steps(3);
+    let s = session(&mut h);
+    assert_eq!(s.view, View::List(Scope::All));
+    assert_eq!(s.list.status, Some(ReadingStatus::ToRead));
+    assert_eq!(s.visible_rows(Scope::All).len(), 3);
+    assert!(h.query_by_role_and_label(Role::Button, "Reading").is_none(), "no card to click for an empty status");
+
+    // Key Metrics written as a list, one per line.
+    session(&mut h).open_paper(a);
+    h.run_steps(3);
+    h.get_by_label_contains("List").click();
+    h.run_steps(2);
+    assert!(session(&mut h).settings.metrics_as_list);
+    // Problem, Contribution, Methodology, Key Findings, then Key Metrics.
+    for _ in 0..5 {
+        h.key_press(egui::Key::Tab);
+        h.run_steps(1);
+    }
+    type_text(&mut h, "Gain: 30.8 dB");
+    h.key_press(egui::Key::Enter);
+    type_text(&mut h, "- Bandwidth = 26–31 GHz");
+    shot(&mut h, "30_metrics_list");
+    let metrics = crate::model::parse_metrics(&note(session(&mut h), a, "metrics"));
+    let pairs: Vec<(String, String)> = metrics.iter().map(|m| (m.name.clone(), m.value_with_unit())).collect();
+    assert_eq!(pairs, [("Gain".to_string(), "30.8 dB".to_string()), ("Bandwidth".to_string(), "26–31 GHz".to_string())]);
+
+    // Writing the first part made the paper Reading, and said so.
+    assert_eq!(session(&mut h).lib.paper(a).unwrap().status, ReadingStatus::Reading);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Marked as Reading").is_some());
+
+    // Back to the table, which shows the same metrics.
+    h.get_by_label_contains("Table").click();
+    h.run_steps(2);
+    shot(&mut h, "31_metrics_table");
+    assert!(!session(&mut h).settings.metrics_as_list);
+
+    // Every part written: Summarised, and Home's Summarised card lists it.
+    let s = session(&mut h);
+    for f in s.lib.fields(None).unwrap().iter().filter(|f| f.kind != crate::model::FieldKind::Relevance && f.key != "metrics") {
+        s.lib.set_note(a, f.id, "Written").unwrap();
+    }
+    assert_eq!(s.lib.paper(a).unwrap().status, ReadingStatus::Summarised);
+    s.go(View::Home);
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "Summarised").click();
+    h.run_steps(3);
+    let s = session(&mut h);
+    assert_eq!(s.list.status, Some(ReadingStatus::Summarised));
+    assert_eq!(s.visible_rows(Scope::All).iter().map(|r| r.id).collect::<Vec<_>>(), [a]);
+}
+
+#[test]
+fn spreadsheet_import_and_notes_export() {
+    let dir = tempfile::tempdir().unwrap();
+    // A review sheet like a student keeps: no heading over the DOIs, questions as headings.
+    let sheet = dir.path().join("Lit Review.xlsx");
+    {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let ws = book.add_worksheet();
+        let rows = [
+            ["", "Paper Name", "What did they do", "How did they do", "Frequency Range", "Why it is relevant for me", "Additional Points"],
+            ["DOI: 10.1109/TAP.2025.1234", "A 2-bit reconfigurable\nsurface", "Two diodes per cell", "Full-wave simulation", "26-31 GHz", "Same band as mine", "Ask about bias"],
+            ["", "Varactor reflectarrays", "Varactor tuning", "", "", "", ""],
+        ];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                ws.write_string(r as u32, c as u16, *cell).unwrap();
+            }
+        }
+        book.save(&sheet).unwrap();
+    }
+    let mut h = harness(&dir.path().join("library.litanatomy"), Settings { theme_mode: ThemeMode::Light, ..Default::default() });
+    let s = session(&mut h);
+    s.net.offline = true;
+    let viva = s.lib.create_collection("Viva", None, 0).unwrap();
+    s.refresh_cache();
+    s.import_file(&sheet, Some(viva));
+    h.run_steps(3);
+    assert!(matches!(session(&mut h).dialog, Some(Dialog::ImportSheet(_))), "the mapping dialog opens");
+    assert!(h.query_by_label_contains("2 papers to import").is_some());
+    shot(&mut h, "40_sheet_mapping");
+    // Make "Additional Points" a new field instead of Further Notes.
+    if let Some(Dialog::ImportSheet(form)) = &mut session(&mut h).dialog {
+        form.columns.iter_mut().find(|c| c.header == "Additional Points").unwrap().target = crate::import::sheet::Target::NewField;
+    }
+    click_when_still(&mut h, "Continue");
+    assert!(matches!(session(&mut h).dialog, Some(Dialog::Import(_))), "then the usual preview");
+    h.run_steps(3);
+    shot(&mut h, "41_sheet_preview");
+    assert!(h.query_by_label_contains("notes from the spreadsheet").is_some());
+    click_when_still(&mut h, "Import 2 new papers");
+    let s = session(&mut h);
+    let rows = s.lib.rows(Scope::Collection(viva)).unwrap();
+    assert_eq!(rows.len(), 2);
+    let surface = rows.iter().find(|r| r.title == "A 2-bit reconfigurable surface").expect("title joined onto one line");
+    let paper = s.lib.paper(surface.id).unwrap();
+    assert_eq!(paper.bib.doi.as_deref(), Some("10.1109/tap.2025.1234"));
+    assert_eq!(paper.status, ReadingStatus::Reading, "notes written: Reading");
+    assert_eq!(note(s, surface.id, "contribution"), "Two diodes per cell");
+    assert_eq!(note(s, surface.id, "methodology"), "Full-wave simulation");
+    assert!(note(s, surface.id, "metrics").contains("Frequency Range"));
+    assert_eq!(s.lib.relevance(viva, surface.id).unwrap().as_deref(), Some("Same band as mine"));
+    let extra = s.lib.fields(None).unwrap().into_iter().find(|f| f.label == "Additional Points").expect("new field");
+    assert_eq!(s.lib.notes(surface.id).unwrap()[&extra.id], "Ask about bias");
+    // The mapping is remembered.
+    assert_eq!(s.settings.sheet_columns.get("additional points").map(String::as_str), Some("newfield"));
+
+    // Export the collection's notes: the dialog, then each format.
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    s.export_notes(ids, Some(viva), "Viva");
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Save as PDF").is_some());
+    shot(&mut h, "42_export_notes");
+    let s = session(&mut h);
+    let Some(Dialog::ExportNotes(form)) = s.dialog.take() else { panic!("export dialog") };
+    let mut form = *form;
+    for f in crate::export::dissection::Format::ALL {
+        form.format = f;
+        let path = dir.path().join(crate::export::dissection::file_name("Viva", f));
+        s.export_notes_to(&form, &path).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 100);
+    }
+    let md = std::fs::read_to_string(dir.path().join("Viva – dissection.md")).unwrap();
+    assert!(md.contains("Two diodes per cell") && md.contains("### Additional Points"));
+}

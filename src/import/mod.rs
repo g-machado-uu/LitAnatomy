@@ -9,6 +9,7 @@ pub mod names;
 pub mod pdf;
 pub mod refworks;
 pub mod ris;
+pub mod sheet;
 pub mod zotero;
 
 use std::path::Path;

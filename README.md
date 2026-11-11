@@ -22,6 +22,11 @@ This application was developed with the assistance of Claude Code using Opus 5.5
 - **Import references** from BibTeX, BibLaTeX, RIS (EndNote, Mendeley, Zotero,
   Web of Science, Scopus, IEEE Xplore), RefWorks and CSL-JSON. A preview shows
   each paper's new key and any duplicates before importing.
+- **Import your own review spreadsheet** (Excel, LibreOffice or CSV, a row
+  per paper). You choose where each column goes: the paper's details, a part
+  of its anatomy, a metric, or a new field named after the column. The
+  mapping is guessed from the headings and remembered for next time. DOIs can
+  be looked up to fill in the authors, year and journal.
 - **Import from Zotero** (Add papers › From Zotero…): the papers whose PDFs
   Zotero has downloaded, with their details, tags and linked PDFs. It reads a
   copy of Zotero's library, so Zotero can stay open and is never changed.
@@ -42,10 +47,16 @@ This application was developed with the assistance of Claude Code using Opus 5.5
   - Further Notes
 
   You can rename, reorder or hide the fields. A collection can add its own,
-  such as "Frequency range". Notes save as you type.
+  such as "Frequency range". Notes save as you type. Key Metrics can be
+  filled in as a table (name, value, unit) or written as a list, one
+  `Name: value unit` per line; each metric's name becomes a matrix column.
 
 - **Synthesis matrix.** Compare papers side by side, then export the table to
   CSV, Markdown or LaTeX.
+- **Export the dissections** of a collection, a selection or one paper as a
+  PDF (with a list of the papers and bookmarks), a Word document, an Excel
+  workbook (which imports again), CSV or Markdown. Useful for supervisor
+  meetings and for writing up.
 - **Synthesis notes for a collection.** Group its papers into themes, note
   what each theme's papers share and how each paper fits, keep overview notes,
   and draft a related-work outline (a section per theme, with `\cite` keys and
@@ -65,7 +76,10 @@ This application was developed with the assistance of Claude Code using Opus 5.5
 - **Links between papers**: builds on, extends, contradicts, compares
   against, same group.
 - **Reading status, tags and full-text search** across titles, authors and
-  notes.
+  notes. The status follows your notes: a paper becomes Reading once you write
+  one part of it, and Summarised once every part is written (you can turn this
+  off in Settings). Click To read, Reading or Summarised on Home to list those
+  papers.
 - **Keyboard shortcuts.** Tab and Shift+Tab move between a paper's notes,
   Ctrl+Enter (Cmd+Enter on a Mac) stops editing, Esc goes back a level, and
   Ctrl+Shift+Delete moves the open paper to the Trash. F1, or the keyboard

@@ -1,6 +1,6 @@
 [package]
 name = "litanatomy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Required by egui 0.37.
 rust-version = "1.95"
@@ -9,22 +9,35 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
+# Reading review spreadsheets (.xlsx, .xls, .ods) to import.
+calamine = { version = "0.38.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 deunicode = "1.6"
 directories = "6.0.0"
 eframe = "0.37"
+# Compressing the streams of exported PDFs.
+flate2 = "1.1"
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
 egui_extras = "0.37"
 open = "5.4"
 # PDF text and properties, for importing papers from their PDFs.
 pdf-extract = "0.12"
+# Notes' Markdown, for the Word and PDF exports.
+pulldown-cmark = { version = "0.13", default-features = false }
 rfd = "0.17.2"
+# Excel export of the dissections.
+rust_xlsxwriter = "0.102"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Fonts embedded in exported PDFs: metrics, and only the glyphs used.
+subsetter = "0.2"
 toml = "1.1"
+ttf-parser = "0.25"
 ureq = "3.5"
+# Word (.docx) export: a docx is a zip of XML files.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Picking X11 (XWayland) on Wayland desktops, where winit can't receive dropped files.
 [target.'cfg(target_os = "linux")'.dependencies]

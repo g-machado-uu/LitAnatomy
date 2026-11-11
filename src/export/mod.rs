@@ -1,8 +1,13 @@
 //! Writing references and tables out of the library.
 
 pub mod bibtex;
+pub mod blocks;
+pub mod dissection;
+pub mod docx;
 pub mod matrix;
 pub mod outline;
+pub mod pdf;
+pub mod xlsx;
 
 use std::path::Path;
 

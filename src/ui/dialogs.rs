@@ -9,6 +9,7 @@ use crate::app::{Session, View};
 use crate::citekey;
 use crate::db::{Library, Scope};
 use crate::import::ident::Identifier;
+use crate::import::sheet::SheetNote;
 use crate::model::{Collection, Criterion, CriterionKind, Field, FieldKind, NewPaper, authors_short};
 use crate::net::Found;
 use crate::pdf;
@@ -28,6 +29,10 @@ pub enum Dialog {
     ConfirmTrash(i64),
     /// The list of keyboard shortcuts (F1).
     Shortcuts,
+    /// A review spreadsheet: which column goes where.
+    ImportSheet(Box<crate::ui::sheet::SheetForm>),
+    /// Saving papers' notes as a document or table.
+    ExportNotes(Box<crate::ui::export::ExportForm>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,11 +52,13 @@ pub struct Candidate {
     pub choice: Choice,
     /// How it was found (papers from PDFs), and whether to check it.
     pub note: Option<(String, bool)>,
+    /// From a spreadsheet: its notes, written once the paper is imported.
+    pub sheet: Vec<SheetNote>,
 }
 
 impl Candidate {
     pub fn new(paper: NewPaper) -> Self {
-        Self { paper, key: String::new(), duplicate: None, choice: Choice::Add, note: None }
+        Self { paper, key: String::new(), duplicate: None, choice: Choice::Add, note: None, sheet: Vec::new() }
     }
 
     pub fn found(f: Found) -> Self {
@@ -124,6 +131,18 @@ impl ImportState {
             }
         }
         self.checked = self.candidates.len();
+    }
+
+    /// Looks for duplicates again (after lookups changed the details),
+    /// keeping what the user chose for papers that aren't duplicates.
+    pub fn recheck(&mut self, lib: &Library, pattern: &str) {
+        for c in &mut self.candidates {
+            if c.duplicate.take().is_some() || c.choice == Choice::Skip {
+                c.choice = Choice::Add;
+            }
+        }
+        self.checked = 0;
+        self.refresh(lib, pattern);
     }
 }
 
@@ -204,6 +223,8 @@ impl Session {
                 })
             }
             Dialog::Shortcuts => self.shortcuts_dialog(ui),
+            Dialog::ImportSheet(form) => self.sheet_dialog(ui, form),
+            Dialog::ExportNotes(form) => self.export_notes_dialog(ui, form),
         };
         if keep && self.dialog.is_none() {
             self.dialog = Some(dialog);
@@ -385,6 +406,10 @@ impl Session {
                                 ui.label(RichText::new(format!("{} {name}", icons::FILE_PDF)).small().color(theme::muted(ui)))
                                     .on_hover_text(pdf.as_str());
                             }
+                            if !c.sheet.is_empty() {
+                                let text = format!("{} {} from the spreadsheet", icons::NOTE_PENCIL, plural(c.sheet.len(), "note"));
+                                ui.label(RichText::new(text).small().color(theme::muted(ui)));
+                            }
                             if let Some((note, sure)) = &c.note {
                                 let (icon, colour) = if *sure { (icons::CHECK, theme::muted(ui)) } else { (icons::WARNING, theme::fg(ui, theme::AMBER)) };
                                 ui.add(egui::Label::new(RichText::new(format!("{icon} {note}")).small().color(colour)).wrap());
@@ -455,8 +480,10 @@ impl Session {
     fn commit_import(&mut self, state: &mut ImportState) {
         let mut added = 0;
         let mut touched = Vec::new();
+        // Spreadsheet notes, written once the papers are in their collection: (paper, row, already in the library).
+        let mut sheet_notes: Vec<(i64, usize, bool)> = Vec::new();
         let mut first_error = None;
-        for c in &state.candidates {
+        for (ci, c) in state.candidates.iter().enumerate() {
             let id = match (c.choice, &c.duplicate) {
                 (Choice::Skip, _) => continue,
                 (Choice::UseExisting, Some((id, _))) => Some(*id),
@@ -474,6 +501,9 @@ impl Session {
                     match self.lib.insert_paper(&paper, &key) {
                         Ok(id) => {
                             added += 1;
+                            if !c.sheet.is_empty() {
+                                sheet_notes.push((id, ci, false));
+                            }
                             Some(id)
                         }
                         Err(e) => {
@@ -484,6 +514,9 @@ impl Session {
                 }
             };
             if let Some(id) = id {
+                if c.duplicate.is_some() && matches!(c.choice, Choice::UseExisting | Choice::Merge) && !c.sheet.is_empty() {
+                    sheet_notes.push((id, ci, true));
+                }
                 touched.push(id);
                 // A paper already in the library gets the PDF if it has none.
                 if c.duplicate.is_some()
@@ -504,6 +537,13 @@ impl Session {
         }
         let r = self.lib.restore(&touched);
         self.check(r);
+        let mut created = std::collections::HashMap::new();
+        for (id, ci, existing) in sheet_notes {
+            let notes = &state.candidates[ci].sheet;
+            if let Err(e) = crate::import::sheet::apply(&mut self.lib, id, notes, state.target, &mut created, existing) {
+                first_error.get_or_insert(e);
+            }
+        }
         match first_error {
             Some(e) => self.error(format!("Some papers could not be imported: {e:#}")),
             None => {
@@ -511,6 +551,11 @@ impl Session {
                 let mut msg = format!("Imported {}.", plural(added, "new paper"));
                 if existing > 0 {
                     msg.push_str(&format!(" {} were already in your library.", existing));
+                }
+                if !created.is_empty() {
+                    let mut names: Vec<String> = created.keys().map(|n| format!("\"{n}\"")).collect();
+                    names.sort();
+                    msg.push_str(&format!(" New fields: {}. Rename or hide them in Settings.", names.join(", ")));
                 }
                 self.info(msg);
             }

@@ -107,7 +107,7 @@ impl Session {
     /// Look up, Import file… and Zotero…; returns whether Look up was pressed.
     fn quick_add_buttons(&mut self, ui: &mut Ui) -> bool {
         let go = ui.add(theme::primary_button(ui, format!("{} Look up", icons::MAGIC_WAND))).clicked();
-        if ui.button(format!("{} Import file…", icons::DOWNLOAD_SIMPLE)).on_hover_text("BibTeX, BibLaTeX, RIS, RefWorks or CSL-JSON").clicked() {
+        if ui.button(format!("{} Import file…", icons::DOWNLOAD_SIMPLE)).on_hover_text("BibTeX, BibLaTeX, RIS, RefWorks or CSL-JSON, or your own review spreadsheet (Excel, LibreOffice or CSV)").clicked() {
             self.pick_import_file();
         }
         if ui.button(format!("{} Zotero…", icons::BOOKS)).on_hover_text("Import the papers whose PDFs Zotero has downloaded").clicked() {
@@ -116,28 +116,63 @@ impl Session {
         go
     }
 
+    /// Papers, To read, Reading and Summarised. A click lists those papers.
     fn stat_row(&mut self, ui: &mut Ui, total: usize, counts: &std::collections::HashMap<ReadingStatus, usize>) {
+        let count = |s| counts.get(&s).copied().unwrap_or(0);
         let stats = [
-            (icons::BOOKS, theme::accent(ui), "Papers", total),
-            (icons::CIRCLE_DASHED, theme::SLATE, "To read", counts.get(&ReadingStatus::ToRead).copied().unwrap_or(0)),
-            (icons::CIRCLE_HALF, theme::AMBER, "Reading", counts.get(&ReadingStatus::Reading).copied().unwrap_or(0)),
-            (icons::CHECK_CIRCLE, theme::GREEN, "Summarised", counts.get(&ReadingStatus::Summarised).copied().unwrap_or(0)),
+            (None, icons::BOOKS, theme::accent(ui), "Papers", total),
+            (Some(ReadingStatus::ToRead), icons::CIRCLE_DASHED, theme::SLATE, "To read", count(ReadingStatus::ToRead)),
+            (Some(ReadingStatus::Reading), icons::CIRCLE_HALF, theme::AMBER, "Reading", count(ReadingStatus::Reading)),
+            (Some(ReadingStatus::Summarised), icons::CHECK_CIRCLE, theme::GREEN, "Summarised", count(ReadingStatus::Summarised)),
         ];
+        let mut open = None;
         ui.columns(4, |cols| {
-            for (col, (icon, colour, label, n)) in cols.iter_mut().zip(stats) {
-                theme::card_frame(col).show(col, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        theme::icon_badge(ui, icon, colour, 38.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.label(theme::semibold(n.to_string()).size(22.0));
-                            ui.label(RichText::new(label).small().color(theme::muted(ui)));
+            for (col, (status, icon, colour, label, n)) in cols.iter_mut().zip(stats) {
+                let resp = theme::card_frame(col)
+                    .show(col, |ui| {
+                        ui.style_mut().interaction.selectable_labels = false;
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            theme::icon_badge(ui, icon, colour, 38.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(theme::semibold(n.to_string()).size(22.0));
+                                ui.label(RichText::new(label).small().color(theme::muted(ui)));
+                            });
                         });
-                    });
-                });
+                    })
+                    .response;
+                if n == 0 {
+                    continue;
+                }
+                let resp = resp.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+                if resp.hovered() {
+                    let stroke = egui::Stroke::new(1.5, theme::fg(col, colour));
+                    col.painter().rect_stroke(resp.rect, egui::CornerRadius::same(14), stroke, egui::StrokeKind::Inside);
+                }
+                let tip = match status {
+                    None => "Show every paper".to_string(),
+                    Some(s) => format!("Show the papers marked {}", s.label()),
+                };
+                if resp.on_hover_text(tip).clicked() {
+                    open = Some(status);
+                }
             }
         });
+        if let Some(status) = open {
+            self.show_all_papers(status, None);
+        }
+    }
+
+    /// All papers, filtered by `status` or `attention` only (other filters are cleared).
+    fn show_all_papers(&mut self, status: Option<ReadingStatus>, attention: Option<Attention>) {
+        self.go(View::List(Scope::All));
+        self.list.search.clear();
+        self.list.tag = None;
+        self.list.decision = None;
+        self.list.status = status;
+        self.list.attention = attention;
     }
 
     fn collection_cards(&mut self, ui: &mut Ui) {
@@ -262,8 +297,7 @@ impl Session {
                     if n == 0 {
                         ui.label(RichText::new(label).color(theme::muted(ui)));
                     } else if ui.link(label).clicked() {
-                        self.go(View::List(Scope::All));
-                        self.list.attention = Some(filter);
+                        self.show_all_papers(None, Some(filter));
                     }
                 });
             }

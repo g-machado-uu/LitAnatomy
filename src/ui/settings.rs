@@ -296,6 +296,15 @@ impl Session {
         theme::card(ui, "Anatomy fields", |ui| {
             theme::hint(ui, "The parts every paper is dissected into. Rename them, change their prompts, reorder or hide them. Fields for one collection only are set in that collection's settings.");
             ui.add_space(6.0);
+            if ui.checkbox(&mut self.settings.auto_status, "Update the reading status as the notes are written").changed() {
+                self.save_settings(ui.ctx());
+            }
+            theme::hint(
+                ui,
+                "A paper becomes Reading once one part is written, and Summarised once every part shown here is. \
+                 It never moves back, so a status you set yourself is kept.",
+            );
+            ui.add_space(6.0);
             let mut update = None;
             let mut moved = None;
             let mut delete = None;

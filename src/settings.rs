@@ -53,6 +53,20 @@ pub struct Settings {
     /// Linux: a native Wayland window instead of XWayland (sharper when
     /// scaled, but files can't be dropped on it). Read at start-up.
     pub native_wayland: bool,
+    /// Writing a paper's notes moves its status to Reading, and to
+    /// Summarised once every part is written.
+    pub auto_status: bool,
+    /// Key Metrics are edited as a plain list, one "Name: value unit" per line,
+    /// instead of a table.
+    pub metrics_as_list: bool,
+    /// The last export of papers' notes: its format and options.
+    pub notes_format: crate::export::dissection::Format,
+    pub notes_abstracts: bool,
+    pub notes_empty: bool,
+    pub notes_page_per_paper: bool,
+    /// Spreadsheet imports: where each heading's column went last time
+    /// (normalised heading → target). Last: TOML writes tables after values.
+    pub sheet_columns: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -70,6 +84,13 @@ impl Default for Settings {
             contact_email: String::new(),
             keep_readable_keys: false,
             native_wayland: false,
+            auto_status: true,
+            metrics_as_list: false,
+            notes_format: crate::export::dissection::Format::Pdf,
+            notes_abstracts: false,
+            notes_empty: false,
+            notes_page_per_paper: true,
+            sheet_columns: Default::default(),
         }
     }
 }

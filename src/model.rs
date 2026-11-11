@@ -412,6 +412,67 @@ impl Metric {
     }
 }
 
+/// Metrics as a plain list, one "Name: value unit" per line.
+pub fn metrics_to_text(metrics: &[Metric]) -> String {
+    metrics
+        .iter()
+        .filter(|m| !m.name.trim().is_empty() || !m.value.trim().is_empty())
+        .map(|m| {
+            let value = m.value_with_unit();
+            if value.trim().is_empty() { m.name.trim().to_string() } else { format!("{}: {}", m.name.trim(), value.trim()) }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads a list written by hand, one metric per line: "Gain: 30.8 dB",
+/// "- Bandwidth = 26–31 GHz" or "Efficiency 85 %". Blank lines are skipped.
+pub fn metrics_from_text(text: &str) -> Vec<Metric> {
+    text.lines().filter_map(metric_from_line).collect()
+}
+
+fn metric_from_line(line: &str) -> Option<Metric> {
+    // Bullets from pasted lists.
+    let line = line.trim().trim_start_matches(['-', '*', '•', '–', '·']).trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (name, rest) = match line.find([':', '=', '\t']) {
+        Some(i) => (&line[..i], &line[i + 1..]),
+        // No separator: the name ends where the first number starts ("Gain 30.8 dB").
+        None => {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let number = |w: &&str| {
+                let w = w.trim_start_matches(['-', '+', '−', '±', '~', '≈', '<', '>', '≤', '≥']);
+                w.starts_with(|c: char| c.is_ascii_digit())
+            };
+            match words.iter().position(number).filter(|i| *i > 0) {
+                Some(i) => {
+                    let start = line.find(words[i]).unwrap_or(line.len());
+                    (&line[..start], &line[start..])
+                }
+                None => (line, ""),
+            }
+        }
+    };
+    let (value, unit) = split_unit(rest.trim());
+    Some(Metric { name: name.trim().to_string(), value, unit })
+}
+
+/// "30.8 dB" → ("30.8", "dB"). Only a plain number (or range) keeps its unit
+/// apart; anything else ("30.8 dB at 28 GHz") stays whole in the value.
+fn split_unit(rest: &str) -> (String, String) {
+    if let Some((value, unit)) = rest.rsplit_once(char::is_whitespace) {
+        let value = value.trim();
+        let unit_like = !unit.is_empty() && unit.chars().count() <= 8 && !unit.chars().any(|c| c.is_ascii_digit() || c == '(');
+        let numeric = value.chars().any(|c| c.is_ascii_digit()) && !value.chars().any(char::is_alphabetic);
+        if unit_like && numeric {
+            return (value.to_string(), unit.to_string());
+        }
+    }
+    (rest.to_string(), String::new())
+}
+
 pub fn parse_quotes(s: &str) -> Vec<Quote> {
     if s.trim().is_empty() {
         return Vec::new();
@@ -566,5 +627,30 @@ mod tests {
         assert_eq!(parse_metrics(&json_or_empty(&m)), m);
         assert_eq!(m[0].value_with_unit(), "30.8 dB");
         assert!(parse_metrics("").is_empty());
+    }
+
+    #[test]
+    fn metrics_as_text() {
+        let m = |name: &str, value: &str, unit: &str| Metric { name: name.into(), value: value.into(), unit: unit.into() };
+        let text = "Gain: 30.8 dB\n\n- Bandwidth = 26–31 GHz\n• Efficiency 85 %\nPhase states: 4 (2-bit)\n\
+                    Peak gain: 30.8 dB at 28 GHz\nSubstrate: Rogers RO4003C\nSize 0.5 × 0.5 λ\nReconfigurable";
+        assert_eq!(
+            metrics_from_text(text),
+            vec![
+                m("Gain", "30.8", "dB"),
+                m("Bandwidth", "26–31", "GHz"),
+                m("Efficiency", "85", "%"),
+                m("Phase states", "4 (2-bit)", ""),
+                m("Peak gain", "30.8 dB at 28 GHz", ""),
+                m("Substrate", "Rogers RO4003C", ""),
+                m("Size", "0.5 × 0.5", "λ"),
+                m("Reconfigurable", "", ""),
+            ]
+        );
+        // Written out and read back, the list is the same.
+        let parsed = metrics_from_text(text);
+        assert_eq!(metrics_from_text(&metrics_to_text(&parsed)), parsed);
+        assert_eq!(metrics_to_text(&parsed[..2]), "Gain: 30.8 dB\nBandwidth: 26–31 GHz");
+        assert!(metrics_from_text(" \n - \n").is_empty());
     }
 }

@@ -153,6 +153,9 @@ impl Library {
         self.conn.execute("UPDATE papers SET modified_at = ?2 WHERE id = ?1", params![paper, now])?;
         self.reindex(paper)?;
         self.touch();
+        if self.auto_status {
+            self.advance_status(paper)?;
+        }
         Ok(())
     }
 }

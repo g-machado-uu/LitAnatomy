@@ -7,6 +7,10 @@ use super::{Library, Scope};
 use crate::citekey;
 use crate::model::{Author, Biblio, NewPaper, Paper, PaperRow, ReadingStatus, authors_short, now_string};
 
+/// A written note (`n`) in a field (`f`) that counts towards "dissected":
+/// library-wide, shown, and not the per-collection relevance.
+const DISSECTED: &str = "f.collection_id IS NULL AND f.hidden = 0 AND f.kind <> 'relevance' AND trim(n.content) <> ''";
+
 const PAPER_COLS: &str = "id, citekey, key_pinned, entry_type, title, authors, year, month, container, volume, issue,
     pages, publisher, doi, url, isbn, arxiv_id, abstract, keywords, extra_fields, pdf_path, status, rating,
     added_at, modified_at, deleted_at";
@@ -324,8 +328,7 @@ impl Library {
             "SELECT p.id, p.citekey, p.title, p.authors, p.year, p.container, p.status, p.rating,
                     p.pdf_path IS NOT NULL, p.doi IS NOT NULL,
                     (SELECT count(*) FROM notes n JOIN fields f ON f.id = n.field_id
-                     WHERE n.paper_id = p.id AND f.collection_id IS NULL AND f.hidden = 0
-                       AND f.kind <> 'relevance' AND trim(n.content) <> ''),
+                     WHERE n.paper_id = p.id AND {DISSECTED}),
                     p.modified_at
              FROM papers p WHERE {filter} ORDER BY p.added_at DESC, p.id DESC"
         );
@@ -354,6 +357,38 @@ impl Library {
             None => stmt.query_map([], map)?.collect::<rusqlite::Result<Vec<_>>>()?,
         };
         Ok(rows)
+    }
+
+    /// Moves a paper's reading status forward to match its notes: Reading
+    /// once one library-wide field is written, Summarised once all are. It
+    /// never moves back, so a status set by hand is kept. Returns the new
+    /// status if it changed.
+    pub fn advance_status(&mut self, id: i64) -> Result<Option<ReadingStatus>> {
+        let total = self.library_field_count()?;
+        let (status, filled): (i64, i64) = self.conn.query_row(
+            &format!(
+                "SELECT p.status, (SELECT count(*) FROM notes n JOIN fields f ON f.id = n.field_id
+                                   WHERE n.paper_id = p.id AND {DISSECTED})
+                 FROM papers p WHERE p.id = ?1"
+            ),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let current = ReadingStatus::from_i64(status);
+        let filled = filled as usize;
+        let target = if total > 0 && filled >= total {
+            ReadingStatus::Summarised
+        } else if filled > 0 {
+            ReadingStatus::Reading
+        } else {
+            ReadingStatus::ToRead
+        };
+        if target.to_i64() <= current.to_i64() {
+            return Ok(None);
+        }
+        self.conn.execute("UPDATE papers SET status = ?2 WHERE id = ?1", params![id, target.to_i64()])?;
+        self.touch();
+        Ok(Some(target))
     }
 
     /// How many library-wide fields count towards "dissected".

@@ -35,6 +35,9 @@ pub struct Library {
     conn: Connection,
     path: Option<PathBuf>,
     revision: u64,
+    /// Writing notes moves the paper's reading status forward (see
+    /// [`Library::advance_status`]). Follows the setting of the same name.
+    pub auto_status: bool,
 }
 
 const SCHEMA_VERSION: i64 = 2;
@@ -204,7 +207,7 @@ impl Library {
                 bail!("This file is not a LitAnatomy library.");
             }
         }
-        let mut lib = Library { conn, path, revision: 1 };
+        let mut lib = Library { conn, path, revision: 1, auto_status: true };
         lib.migrate(version)?;
         Ok(lib)
     }

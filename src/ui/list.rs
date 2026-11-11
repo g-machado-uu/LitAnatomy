@@ -199,6 +199,19 @@ impl Session {
                 };
                 self.export_bib(&ids, &title);
             }
+            if ui
+                .button(format!("{} Export notes…", icons::FILE_TEXT))
+                .on_hover_text("Save these papers' dissections as a PDF, Word, Excel, CSV or Markdown file")
+                .clicked()
+            {
+                let ids: Vec<i64> = if self.list.selected.is_empty() {
+                    rows.iter().map(|r| r.id).collect()
+                } else {
+                    rows.iter().map(|r| r.id).filter(|id| self.list.selected.contains(id)).collect()
+                };
+                let context = if let Scope::Collection(id) = scope { Some(id) } else { None };
+                self.export_notes(ids, context, title.clone());
+            }
             if ui.button(format!("{} Matrix", icons::TABLE)).on_hover_text("Compare these papers side by side").clicked() {
                 self.go(View::Matrix(scope));
             }
@@ -406,6 +419,17 @@ impl Session {
                         if ui.button(format!("{} Export .bib", icons::EXPORT)).clicked() {
                             let name = format!("{}-selection", self.scope_title(scope));
                             self.export_bib(&ids, &name);
+                        }
+                        if ui
+                            .button(format!("{} Export notes…", icons::FILE_TEXT))
+                            .on_hover_text("Save the selected papers' dissections as a PDF, Word, Excel, CSV or Markdown file")
+                            .clicked()
+                        {
+                            // In the order the list shows them.
+                            let ordered: Vec<i64> = rows.iter().map(|r| r.id).filter(|id| ids.contains(id)).collect();
+                            let context = if let Scope::Collection(id) = scope { Some(id) } else { None };
+                            let title = self.scope_title(scope);
+                            self.export_notes(ordered, context, title);
                         }
                         if ui.button(format!("{} Move to Trash", icons::TRASH)).clicked() {
                             let r = self.lib.trash(&ids);

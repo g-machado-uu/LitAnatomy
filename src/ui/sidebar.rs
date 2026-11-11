@@ -106,6 +106,13 @@ impl Session {
                 self.pick_import_file();
             }
             if ui
+                .button(format!("{}  From a spreadsheet…", icons::TABLE))
+                .on_hover_text("Your own review table (Excel, LibreOffice or CSV): you choose where each column goes")
+                .clicked()
+            {
+                self.pick_sheet_file();
+            }
+            if ui
                 .button(format!("{}  From Zotero…", icons::BOOKS))
                 .on_hover_text("The papers whose PDFs Zotero has downloaded, with their details")
                 .clicked()

@@ -42,6 +42,8 @@ pub enum Lookup {
     Preview,
     /// Refresh a paper's metadata from its DOI, arXiv ID or ISBN.
     Refresh(i64),
+    /// Fill in the import preview's papers (rows of a spreadsheet) from their DOIs.
+    Fill,
 }
 
 /// Lists for the sidebar and dashboard, rebuilt when the library changes.
@@ -136,8 +138,9 @@ impl LitAnatomyApp {
 }
 
 impl Session {
-    pub fn new(lib: Library, settings: Settings, settings_path: Option<PathBuf>) -> Self {
+    pub fn new(mut lib: Library, settings: Settings, settings_path: Option<PathBuf>) -> Self {
         let settings_form = SettingsForm::from(&settings);
+        lib.auto_status = settings.auto_status;
         let mut s = Self {
             auto: AutoExport { done_rev: lib.revision(), ..Default::default() },
             lib,
@@ -279,11 +282,22 @@ impl Session {
     /// Saves typed notes: all of them, or only those left alone for a moment.
     pub fn flush_page(&mut self, all: bool) {
         let now = self.now;
-        if let Some(page) = &mut self.page {
-            let result = page.flush(&mut self.lib, if all { None } else { Some(now) });
-            if let Err(e) = result {
-                self.error(format!("Could not save your notes: {e:#}"));
-            }
+        let Some(page) = self.page.as_mut().filter(|p| p.has_unsaved()) else { return };
+        let before = self.lib.paper(page.id).map(|p| p.status).ok();
+        let result = page.flush(&mut self.lib, if all { None } else { Some(now) });
+        if let Err(e) = result {
+            self.error(format!("Could not save your notes: {e:#}"));
+            return;
+        }
+        // Say so when writing the notes moved the reading status on.
+        let after = self.lib.paper(page.id).map(|p| p.status).ok();
+        if let (Some(before), Some(after)) = (before, after)
+            && before != after
+        {
+            self.info(match after {
+                ReadingStatus::Summarised => "Every part is written: marked as Summarised.".to_string(),
+                _ => format!("Marked as {}.", after.label()),
+            });
         }
     }
 
@@ -381,6 +395,16 @@ impl Session {
                             state.refresh(&self.lib, &self.settings.citekey_pattern);
                         }
                     }
+                    Some(Lookup::Fill) => {
+                        if let Some(Dialog::Import(state)) = &mut self.dialog
+                            && state.pending.is_some_and(|(b, _)| b == batch)
+                        {
+                            fill_candidate(state, &label, result);
+                            if let Some((_, left)) = &mut state.pending {
+                                *left = left.saturating_sub(1);
+                            }
+                        }
+                    }
                     Some(Lookup::Refresh(id)) => match result {
                         Ok(found) => {
                             if let Some(page) = &mut self.page
@@ -395,11 +419,14 @@ impl Session {
                     None => {}
                 },
                 NetMsg::Done { batch } => {
-                    self.lookups.remove(&batch);
+                    let fill = self.lookups.remove(&batch) == Some(Lookup::Fill);
                     if let Some(Dialog::Import(state)) = &mut self.dialog
                         && state.pending.is_some_and(|(b, _)| b == batch)
                     {
                         state.pending = None;
+                        if fill {
+                            state.recheck(&self.lib, &self.settings.citekey_pattern);
+                        }
                     }
                 }
             }
@@ -433,8 +460,13 @@ impl Session {
         self.open_paper(id);
     }
 
-    /// Reads a reference file and opens the import preview.
+    /// Reads a reference file and opens the import preview. A spreadsheet
+    /// first asks where its columns go.
     pub fn import_file(&mut self, path: &Path, target: Option<i64>) {
+        if import::sheet::is_sheet(path) {
+            self.import_sheet(path, target);
+            return;
+        }
         match import::read_file(path) {
             Ok((format, parsed)) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -491,7 +523,9 @@ impl Session {
         let target = self.current_collection();
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Import references")
+            .add_filter("References and spreadsheets", &[import::EXTENSIONS, import::sheet::EXTENSIONS].concat())
             .add_filter("References", import::EXTENSIONS)
+            .add_filter("Spreadsheets", import::sheet::EXTENSIONS)
             .add_filter("All files", &["*"])
             .pick_file()
         {
@@ -626,6 +660,7 @@ impl Session {
 
     pub fn save_settings(&mut self, ctx: &egui::Context) {
         theme::apply(ctx, &self.settings);
+        self.lib.auto_status = self.settings.auto_status;
         if let Some(path) = &self.settings_path {
             let r = self.settings.save(path);
             self.check(r);
@@ -1036,4 +1071,30 @@ fn failed_ui(ui: &mut Ui, error: &mut String, settings: &mut Settings, settings_
         });
     });
     next
+}
+
+/// A DOI looked up for a spreadsheet row: its details fill in the row's
+/// (the spreadsheet's title is kept only if the lookup has none).
+fn fill_candidate(state: &mut ImportState, label: &str, result: Result<crate::net::Found, String>) {
+    match result {
+        Ok(found) => {
+            let doi = found.paper.bib.doi.clone().or_else(|| import::doi::find_all(label).into_iter().next());
+            let Some(c) = state.candidates.iter_mut().find(|c| c.paper.bib.doi.is_some() && c.paper.bib.doi == doi) else { return };
+            let placeholder = c.paper.bib.title.starts_with("DOI ");
+            let mut bib = found.paper.bib;
+            if placeholder {
+                c.paper.bib.title.clear();
+            }
+            bib.fill_from(&c.paper.bib);
+            c.paper.bib = bib;
+            c.note = Some(("Details found online from its DOI.".into(), true));
+        }
+        Err(e) => {
+            // The label is "DOI 10.…": find the row by it.
+            let doi = import::doi::find_all(label).into_iter().next();
+            if let Some(c) = state.candidates.iter_mut().find(|c| doi.is_some() && c.paper.bib.doi == doi) {
+                c.note = Some((format!("Not found online ({e}). The spreadsheet's details are kept."), false));
+            }
+        }
+    }
 }

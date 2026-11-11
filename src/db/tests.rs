@@ -156,6 +156,48 @@ fn notes_relevance_progress_and_search() {
 }
 
 #[test]
+fn notes_move_the_reading_status_forward() {
+    let mut lib = Library::open_in_memory().unwrap();
+    let a = lib.add_paper(&new_paper("Zhang", 2025, "Wideband Surfaces", None), DEFAULT_PATTERN).unwrap();
+    let viva = lib.create_collection("Viva", None, 0).unwrap();
+    lib.add_to_collection(viva, &[a]).unwrap();
+    let status = |lib: &Library| lib.paper(a).unwrap().status;
+    let fields = lib.fields(None).unwrap();
+    let counted: Vec<_> = fields.iter().filter(|f| f.kind != FieldKind::Relevance).collect();
+    // Relevance and collection-only fields don't count.
+    lib.set_relevance(viva, a, "Why it matters").unwrap();
+    let extra = lib.add_field("Frequency range", "", FieldKind::ShortText, Some(viva)).unwrap();
+    lib.set_note(a, extra, "26-31 GHz").unwrap();
+    assert_eq!(status(&lib), ReadingStatus::ToRead);
+    // One part written: Reading.
+    lib.set_note(a, counted[0].id, "Something").unwrap();
+    assert_eq!(status(&lib), ReadingStatus::Reading);
+    // Every part but one: still Reading.
+    for f in &counted[1..counted.len() - 1] {
+        lib.set_note(a, f.id, "Written").unwrap();
+    }
+    assert_eq!(status(&lib), ReadingStatus::Reading);
+    // A hidden field doesn't count, so hiding the last one completes the paper.
+    let mut last = (*counted.last().unwrap()).clone();
+    last.hidden = true;
+    lib.update_field(&last).unwrap();
+    lib.set_note(a, counted[0].id, "Something more").unwrap();
+    assert_eq!(status(&lib), ReadingStatus::Summarised);
+    // It never moves back: emptying a note keeps Summarised…
+    lib.set_note(a, counted[0].id, "").unwrap();
+    assert_eq!(status(&lib), ReadingStatus::Summarised);
+    // …and a status set by hand stays until the notes say more.
+    lib.set_status(a, ReadingStatus::ToRead).unwrap();
+    lib.set_note(a, counted[1].id, "Changed").unwrap();
+    assert_eq!(status(&lib), ReadingStatus::Reading);
+    // Turned off, notes leave the status alone.
+    lib.auto_status = false;
+    lib.set_status(a, ReadingStatus::ToRead).unwrap();
+    lib.set_note(a, counted[0].id, "Again").unwrap();
+    assert_eq!(status(&lib), ReadingStatus::ToRead);
+}
+
+#[test]
 fn custom_fields_per_collection() {
     let mut lib = Library::open_in_memory().unwrap();
     let rf = lib.create_collection("RF surfaces", None, 0).unwrap();

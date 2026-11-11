@@ -13,7 +13,7 @@ use crate::import::ident::{self, Identifier};
 use crate::import::{doi, names, parse_year};
 use crate::model::{
     Biblio, Criterion, CriterionKind, Decision, Field, FieldKind, Metric, Paper, Quote, ReadingStatus, Relation,
-    Screening, authors_long, json_or_empty, parse_metrics, parse_quotes,
+    Screening, authors_long, json_or_empty, metrics_from_text, metrics_to_text, parse_metrics, parse_quotes,
 };
 use crate::net::Job;
 use crate::ui::sidebar::plural;
@@ -122,6 +122,9 @@ pub struct PaperPage {
     pub texts: HashMap<i64, String>,
     pub quotes: HashMap<i64, Vec<Quote>>,
     pub metrics: HashMap<i64, Vec<Metric>>,
+    /// Metrics being written as a list (Settings' `metrics_as_list`): the text
+    /// as typed, which `metrics` is read from.
+    pub metric_text: HashMap<i64, String>,
     /// (collection, why it matters there)
     pub relevance: Vec<(i64, String)>,
     dirty: HashMap<Dirty, f64>,
@@ -154,6 +157,8 @@ enum PageAction {
     /// The next paper to screen in a review, keeping the Screening tab open.
     Screen(i64),
     Synthesis(i64),
+    /// Export this paper's notes.
+    Export,
 }
 
 const ENTRY_TYPES: &[(&str, &str)] = &[
@@ -192,6 +197,7 @@ impl PaperPage {
             texts: HashMap::new(),
             quotes: HashMap::new(),
             metrics: HashMap::new(),
+            metric_text: HashMap::new(),
             relevance: memberships,
             dirty: HashMap::new(),
             preview: HashSet::new(),
@@ -486,6 +492,13 @@ impl Session {
                 PageAction::Open(id) => self.open_paper(id),
                 PageAction::Collection(id) => self.go(View::List(Scope::Collection(id))),
                 PageAction::Synthesis(id) => self.go(View::Synthesis(id)),
+                PageAction::Export => {
+                    if let Some(p) = &self.page {
+                        let (id, context, title) = (p.id, p.context, p.paper.bib.title.clone());
+                        let short: String = title.chars().take(60).collect();
+                        self.export_notes(vec![id], context, short);
+                    }
+                }
                 PageAction::Screen(id) => {
                     // Stay "in" the review: the next paper replaces this one, and Back still goes to the list.
                     let back = self.back.clone();
@@ -524,7 +537,16 @@ impl Session {
                     actions.push(PageAction::Back);
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.pdf_buttons(ui, &p));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.pdf_buttons(ui, &p);
+                if ui
+                    .add(theme::ghost_button(format!("{} Export notes", icons::FILE_TEXT)))
+                    .on_hover_text("Save this paper's dissection as a PDF, Word, Excel, CSV or Markdown file")
+                    .clicked()
+                {
+                    actions.push(PageAction::Export);
+                }
+            });
         });
         ui.add_space(4.0);
         ui.add(egui::Label::new(theme::serif(&p.bib.title, 27.0)).wrap());
@@ -793,6 +815,15 @@ impl Session {
                             }
                         }
                     }
+                    if f.kind == FieldKind::Metrics {
+                        let list = self.settings.metrics_as_list;
+                        // Right to left here, so List comes first to show as "Table | List".
+                        let options = [(true, format!("{} List", icons::LIST_BULLETS)), (false, format!("{} Table", icons::TABLE))];
+                        if let Some(as_list) = theme::segmented(ui, list, &options) {
+                            self.settings.metrics_as_list = as_list;
+                            self.save_settings(ui.ctx());
+                        }
+                    }
                     if f.key == "assessment" {
                         let mut rating = page.rating;
                         if theme::star_rating(ui, &mut rating, 16.0) {
@@ -846,7 +877,31 @@ impl Session {
                     }
                     page.tab_stop(pos, f.id, TabStop::Editor(editor));
                 }
+                FieldKind::Metrics if self.settings.metrics_as_list => {
+                    let metrics = &page.metrics;
+                    let text = page
+                        .metric_text
+                        .entry(f.id)
+                        .or_insert_with(|| metrics_to_text(metrics.get(&f.id).map(Vec::as_slice).unwrap_or_default()));
+                    let rows = text.lines().count().max(3) + 1;
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(text)
+                            .id(editor)
+                            .hint_text("Gain: 30.8 dB\nBandwidth: 26–31 GHz\nEfficiency: 85 %")
+                            .desired_rows(rows)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if resp.changed() {
+                        let parsed = metrics_from_text(text);
+                        page.metrics.insert(f.id, parsed);
+                        page.touch(Dirty::Field(f.id), now);
+                    }
+                    page.tab_stop(pos, f.id, TabStop::Editor(editor));
+                    theme::hint(ui, "One metric per line, as Name: value unit. Each name becomes a column in the matrix.");
+                }
                 FieldKind::Metrics => {
+                    // Written as a list again later: start from the table.
+                    page.metric_text.remove(&f.id);
                     let mut editors = Vec::new();
                     if metrics_editor(ui, page.metrics.entry(f.id).or_default(), editor, &mut editors) {
                         page.touch(Dirty::Field(f.id), now);
@@ -1312,29 +1367,42 @@ impl PaperPage {
     }
 }
 
-/// Name / value / unit rows. Returns true if anything changed.
-/// `base` names the editors, which are listed in `editors` in Tab order.
+/// Name / value / unit rows, as wide as the card. Returns true if anything
+/// changed. `base` names the editors, which are listed in `editors` in Tab order.
 fn metrics_editor(ui: &mut Ui, metrics: &mut Vec<Metric>, base: egui::Id, editors: &mut Vec<egui::Id>) -> bool {
     let mut changed = false;
     let mut remove = None;
     if !metrics.is_empty() {
-        egui::Grid::new(("metrics", base)).num_columns(4).spacing([6.0, 6.0]).show(ui, |ui| {
-            ui.label(RichText::new("Name").small().color(theme::muted(ui)));
-            ui.label(RichText::new("Value").small().color(theme::muted(ui)));
-            ui.label(RichText::new("Unit").small().color(theme::muted(ui)));
-            ui.end_row();
-            for (i, m) in metrics.iter_mut().enumerate() {
-                let ids = [base.with((i, 0)), base.with((i, 1)), base.with((i, 2))];
-                editors.extend(ids);
-                changed |= ui.add(egui::TextEdit::singleline(&mut m.name).id(ids[0]).hint_text("Gain").desired_width(150.0)).changed();
-                changed |= ui.add(egui::TextEdit::singleline(&mut m.value).id(ids[1]).hint_text("30.8").desired_width(110.0)).changed();
-                changed |= ui.add(egui::TextEdit::singleline(&mut m.unit).id(ids[2]).hint_text("dB").desired_width(60.0)).changed();
+        // Plain rows rather than a Grid: a Grid holds each box to its column's
+        // width from the frame before, which kept them narrow.
+        let gap = ui.spacing().item_spacing.x;
+        let margin = egui::Margin::symmetric(6, 5);
+        // The remove button: an icon in a ghost button's padding.
+        let remove_w = 16.0 + 2.0 * ui.spacing().button_padding.x;
+        let width = (ui.available_width() - 3.0 * gap - remove_w - 2.0).max(240.0);
+        let widths = [width * 0.40, width * 0.42, width * 0.18];
+        ui.horizontal(|ui| {
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            for (label, w) in ["Name", "Value", "Unit"].into_iter().zip(widths) {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, font.size + 2.0), egui::Sense::hover());
+                let at = rect.left_center() + egui::vec2(margin.left as f32, 0.0);
+                ui.painter().text(at, egui::Align2::LEFT_CENTER, label, font.clone(), theme::muted(ui));
+            }
+        });
+        for (i, m) in metrics.iter_mut().enumerate() {
+            let ids = [base.with((i, 0)), base.with((i, 1)), base.with((i, 2))];
+            editors.extend(ids);
+            ui.horizontal(|ui| {
+                let cells = [(&mut m.name, "Gain"), (&mut m.value, "30.8"), (&mut m.unit, "dB")];
+                for (((text, hint), id), w) in cells.into_iter().zip(ids).zip(widths) {
+                    let edit = egui::TextEdit::singleline(text).id(id).hint_text(hint).margin(margin).desired_width(w);
+                    changed |= ui.add(edit).changed();
+                }
                 if ui.add(theme::ghost_button(icons::X)).on_hover_text("Remove").clicked() {
                     remove = Some(i);
                 }
-                ui.end_row();
-            }
-        });
+            });
+        }
     }
     if let Some(i) = remove {
         metrics.remove(i);
